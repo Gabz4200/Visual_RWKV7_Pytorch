@@ -7,9 +7,9 @@ from VisualRWKV7.model import Vision_RWKV7
 def main():
     torch.manual_seed(42)
 
+    # Initialize the new Vision-RWKV-7 with Superpixel Tokenization (diffSLIC)
     model = Vision_RWKV7(
         img_size=224,
-        patch_size=16,
         in_chans=3,
         embed_dims=192,
         num_heads=3,
@@ -17,9 +17,14 @@ def main():
         init_values=1e-5,
         final_norm=True,
         out_indices=[3, 5, 7, 11],
+        num_superpixels=196,  # Target number of superpixels (approx 14x14 grid)
+        diff_slic_iters=5,  # Number of iterations for diffSLIC optimization
     )
 
+    # Dummy image input
     x = torch.randn(2, 3, 224, 224)
+
+    # Forward pass
     outs = model(x)
 
     print(f"Input:  {tuple(x.shape)}")
@@ -34,7 +39,7 @@ def main():
     all_finite = all(o.isfinite().all() for o in outs)
     print(f"All outputs finite: {all_finite}")
 
-    # Verify determinant: same input -> same output
+    # Verify deterministic: same input -> same output
     outs2 = model(x)
     deterministic = all(
         (o1 - o2).abs().max().item() < 1e-5 for o1, o2 in zip(outs, outs2)
