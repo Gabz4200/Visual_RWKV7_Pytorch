@@ -2,7 +2,7 @@
 
 import torch
 from VisualRWKV7.model import Vision_RWKV7
-from VisualRWKV7.utils.data import load_image_to_tensor
+from VisualRWKV7.utils.data import preprocess_image_for_rwkv7
 
 # Inspired by: https://arxiv.org/abs/2109.08203
 # Recommended: run 5-10 seeds, report mean ± std
@@ -18,7 +18,7 @@ def main():
     # Initialize the new Vision-RWKV-7 with Superpixel Tokenization (diffSLIC)
     model = Vision_RWKV7(
         img_size=64,
-        in_chans=3,
+        in_chans=6,
         embed_dims=192,
         num_heads=3,
         depth=12,
@@ -48,11 +48,10 @@ def main():
             model._init_weights()
 
             # Dummy image input
-            x = load_image_to_tensor(
+            x = preprocess_image_for_rwkv7(
                 "test_image_from_slirack_pinterest.jpg",
-                color_space="oklab",
                 target_size=(64, 64),
-                normalize=True,
+                include_alpha=True,
             )
 
             # Forward pass

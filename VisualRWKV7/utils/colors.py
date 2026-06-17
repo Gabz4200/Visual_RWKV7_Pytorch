@@ -27,11 +27,21 @@ def from_srgb_to_linear_rgb(srgb: torch.Tensor) -> torch.Tensor:
 
     Args:
         srgb (torch.Tensor): Tensor in (B, C, H, W) format with values in [0, 1].
+            C can be 3 (RGB) or 4 (RGBA).
 
     Returns:
         torch.Tensor: Tensor in (B, C, H, W) format in Linear RGB.
     """
     srgb = srgb.clamp(0.0, 1.0)
+    if srgb.shape[1] == 4:
+        rgb = srgb[:, 0:3, :, :]
+        alpha = srgb[:, 3:4, :, :]
+        linear_rgb = torch.where(
+            rgb >= 0.04045,
+            torch.pow((rgb + 0.055) / 1.055, 2.4),
+            rgb / 12.92,
+        )
+        return torch.cat([linear_rgb, alpha], dim=1)
     return torch.where(
         srgb >= 0.04045,
         torch.pow((srgb + 0.055) / 1.055, 2.4),
@@ -48,11 +58,21 @@ def from_linear_rgb_to_srgb(linear_rgb: torch.Tensor) -> torch.Tensor:
 
     Args:
         linear_rgb (torch.Tensor): Tensor in (B, C, H, W) format with values in [0, 1].
+            C can be 3 (RGB) or 4 (RGBA).
 
     Returns:
         torch.Tensor: Tensor in (B, C, H, W) format in sRGB.
     """
     linear_rgb = linear_rgb.clamp(0.0, 1.0)
+    if linear_rgb.shape[1] == 4:
+        rgb = linear_rgb[:, 0:3, :, :]
+        alpha = linear_rgb[:, 3:4, :, :]
+        srgb = torch.where(
+            rgb >= 0.0031308,
+            1.055 * torch.pow(rgb, 1.0 / 2.4) - 0.055,
+            12.92 * rgb,
+        )
+        return torch.cat([srgb, alpha], dim=1)
     return torch.where(
         linear_rgb >= 0.0031308,
         1.055 * torch.pow(linear_rgb, 1.0 / 2.4) - 0.055,
@@ -76,14 +96,14 @@ def from_linear_rgb_to_oklab(linear_rgb: torch.Tensor) -> torch.Tensor:
     correctly via _cbrt which mirrors C's cbrtf on negative inputs.
 
     Args:
-        linear_rgb (torch.Tensor): Tensor in (B, C, H, W) format with C=3
-            representing (R, G, B) in Linear RGB.
+        linear_rgb (torch.Tensor): Tensor in (B, C, H, W) format with C=3 or 4
+            representing (R, G, B, [A]) in Linear RGB.
 
     Returns:
-        torch.Tensor: Tensor in (B, C, H, W) format with C=3
-            representing (L, a, b) in OkLAB.
+        torch.Tensor: Tensor in (B, C, H, W) format with C=3 or 4
+            representing (L, a, b, [A]) in OkLAB.
     """
-    assert linear_rgb.ndim == 4 and linear_rgb.shape[1] == 3
+    assert linear_rgb.ndim == 4 and linear_rgb.shape[1] in [3, 4]
 
     r = linear_rgb[:, 0:1, :, :]
     g = linear_rgb[:, 1:2, :, :]
@@ -104,7 +124,10 @@ def from_linear_rgb_to_oklab(linear_rgb: torch.Tensor) -> torch.Tensor:
     a = 1.9779984951 * l_ - 2.4285922050 * m_ + 0.4505937099 * s_
     b_ = 0.0259040371 * l_ + 0.7827717662 * m_ - 0.8086757660 * s_
 
-    return torch.cat([L, a, b_], dim=1)
+    res = torch.cat([L, a, b_], dim=1)
+    if linear_rgb.shape[1] == 4:
+        res = torch.cat([res, linear_rgb[:, 3:4, :, :]], dim=1)
+    return res
 
 
 def from_oklab_to_linear_rgb(oklab: torch.Tensor) -> torch.Tensor:
@@ -118,14 +141,14 @@ def from_oklab_to_linear_rgb(oklab: torch.Tensor) -> torch.Tensor:
     Fully differentiable. Cubing handles negatives naturally.
 
     Args:
-        oklab (torch.Tensor): Tensor in (B, C, H, W) format with C=3
-            representing (L, a, b) in OkLAB.
+        oklab (torch.Tensor): Tensor in (B, C, H, W) format with C=3 or 4
+            representing (L, a, b, [A]) in OkLAB.
 
     Returns:
-        torch.Tensor: Tensor in (B, C, H, W) format with C=3
-            representing (R, G, B) in Linear RGB.
+        torch.Tensor: Tensor in (B, C, H, W) format with C=3 or 4
+            representing (R, G, B, [A]) in Linear RGB.
     """
-    assert oklab.ndim == 4 and oklab.shape[1] == 3
+    assert oklab.ndim == 4 and oklab.shape[1] in [3, 4]
 
     L = oklab[:, 0:1, :, :]
     a = oklab[:, 1:2, :, :]
@@ -146,4 +169,7 @@ def from_oklab_to_linear_rgb(oklab: torch.Tensor) -> torch.Tensor:
     g = -1.2684380046 * l_lms + 2.6097574011 * m_lms - 0.3413193965 * s_lms
     b_ = -0.0041960863 * l_lms - 0.7034186147 * m_lms + 1.7076147010 * s_lms
 
-    return torch.cat([r, g, b_], dim=1)
+    res = torch.cat([r, g, b_], dim=1)
+    if oklab.shape[1] == 4:
+        res = torch.cat([res, oklab[:, 3:4, :, :]], dim=1)
+    return res

@@ -195,3 +195,22 @@ def test_gamut_clip_batch_consistency():
 
     assert torch.allclose(batch_out[0], single_out[0], atol=1e-5)
     assert torch.allclose(batch_out[1], single_out[0], atol=1e-5)
+
+
+@pytest.mark.parametrize("clip_func", CLIP_METHODS)
+def test_gamut_clip_rgba_support(clip_func):
+    """Verify that gamut clipping correctly handles and preserves the alpha channel."""
+    torch.manual_seed(42)
+    rgba = torch.randn(2, 4, 16, 16) * 2.0
+    # Ensure alpha is in [0, 1] for sanity, though clipping shouldn't touch it
+    rgba[:, 3, :, :] = torch.rand(2, 16, 16)
+
+    clipped = clip_func(rgba)
+
+    assert clipped.shape == rgba.shape
+    # Alpha should be identical
+    assert torch.allclose(clipped[:, 3, :, :], rgba[:, 3, :, :], atol=1e-7)
+    # RGB should be clipped to [0, 1]
+    rgb_clipped = clipped[:, 0:3, :, :]
+    assert rgb_clipped.min() >= -1e-3
+    assert rgb_clipped.max() <= 1.0 + 1e-3

@@ -47,6 +47,7 @@ _TINY_CONFIG: ModelConfig = {
     "depth": 1,
     "num_superpixels": 9,
     "diff_slic_iters": 2,
+    "in_chans": 6,
 }
 _SMALL_CONFIG: ModelConfig = {
     "img_size": 64,
@@ -55,6 +56,7 @@ _SMALL_CONFIG: ModelConfig = {
     "depth": 2,
     "num_superpixels": 16,
     "diff_slic_iters": 2,
+    "in_chans": 6,
 }
 
 
@@ -265,8 +267,9 @@ def test_vision_rwkv7_forward_hard():
         depth=_SMALL_CONFIG["depth"],
         num_superpixels=_SMALL_CONFIG["num_superpixels"],
         diff_slic_iters=_SMALL_CONFIG["diff_slic_iters"],
+        in_chans=_SMALL_CONFIG["in_chans"],
     )
-    x = torch.randn(1, 3, 64, 64)
+    x = torch.randn(1, 6, 64, 64)
     outs = model(x)
 
     # Output should be scattered back to original [B, C, H, W]
@@ -284,11 +287,12 @@ def test_vision_rwkv7_forward_soft():
         depth=_SMALL_CONFIG["depth"],
         num_superpixels=_SMALL_CONFIG["num_superpixels"],
         diff_slic_iters=_SMALL_CONFIG["diff_slic_iters"],
+        in_chans=_SMALL_CONFIG["in_chans"],
     )
     # Manually switch to soft mode to test that branch
     model.patch_embed.mode = "soft"
 
-    x = torch.randn(1, 3, 64, 64)
+    x = torch.randn(1, 6, 64, 64)
     outs = model(x)
 
     assert len(outs) == 1
@@ -305,9 +309,10 @@ def test_output_matches_input_resolution():
         depth=_TINY_CONFIG["depth"],
         num_superpixels=_TINY_CONFIG["num_superpixels"],
         diff_slic_iters=_TINY_CONFIG["diff_slic_iters"],
+        in_chans=_TINY_CONFIG["in_chans"],
     )
     # Test with a different resolution than img_size
-    x = torch.randn(1, 3, 128, 128)
+    x = torch.randn(1, 6, 128, 128)
     outs = model(x)
 
     # Output must be scattered back to [B, C, 128, 128]
@@ -325,8 +330,9 @@ def test_multi_scale_indices():
         num_superpixels=9,
         diff_slic_iters=2,
         out_indices=[1, 3],
+        in_chans=6,
     )
-    x = torch.randn(1, 3, 64, 64)
+    x = torch.randn(1, 6, 64, 64)
     outs = model(x)
 
     assert len(outs) == 2
@@ -346,8 +352,9 @@ def test_cls_token_behavior():
         diff_slic_iters=_TINY_CONFIG["diff_slic_iters"],
         with_cls_token=True,
         output_cls_token=True,
+        in_chans=_TINY_CONFIG["in_chans"],
     )
-    x = torch.randn(1, 3, 64, 64)
+    x = torch.randn(1, 6, 64, 64)
     outs = model(x)
 
     assert isinstance(outs[0], tuple)
@@ -366,8 +373,9 @@ def test_numerical_stability_long_seq():
         depth=_TINY_CONFIG["depth"],
         num_superpixels=_TINY_CONFIG["num_superpixels"],
         diff_slic_iters=_TINY_CONFIG["diff_slic_iters"],
+        in_chans=_TINY_CONFIG["in_chans"],
     )
-    x = torch.randn(1, 3, 128, 128)
+    x = torch.randn(1, 6, 128, 128)
     outs = model(x)
     assert torch.isfinite(outs[0]).all()
 
@@ -425,8 +433,9 @@ def test_deterministic_behavior():
         depth=_SMALL_CONFIG["depth"],
         num_superpixels=_SMALL_CONFIG["num_superpixels"],
         diff_slic_iters=_SMALL_CONFIG["diff_slic_iters"],
+        in_chans=_SMALL_CONFIG["in_chans"],
     )
-    x = torch.randn(1, 3, 64, 64)
+    x = torch.randn(1, 6, 64, 64)
 
     out1 = model(x)
     out2 = model(x)
@@ -453,8 +462,9 @@ def test_forward_finite_random_input():
         depth=_SMALL_CONFIG["depth"],
         num_superpixels=_SMALL_CONFIG["num_superpixels"],
         diff_slic_iters=_SMALL_CONFIG["diff_slic_iters"],
+        in_chans=_SMALL_CONFIG["in_chans"],
     )
-    x = torch.randn(2, 3, 64, 64)  # batch=2
+    x = torch.randn(2, 6, 64, 64)  # batch=2
     outs = model(x)
     assert all(torch.isfinite(o).all() for o in outs)
     assert len(outs) == 1  # default out_indices
@@ -468,8 +478,9 @@ def test_scatter_output_spatial_shape():
         num_heads=1,
         depth=2,
         num_superpixels=16,
+        in_chans=6,
     )
-    x = torch.randn(1, 3, 128, 128)  # different from img_size
+    x = torch.randn(1, 6, 128, 128)  # different from img_size
     outs = model(x)
     assert outs[0].shape == (1, 64, 128, 128)
 
@@ -484,8 +495,9 @@ def test_multi_scale_output_count():
         depth=depth,
         num_superpixels=16,
         out_indices=[0, 2, 3],
+        in_chans=6,
     )
-    x = torch.randn(1, 3, 64, 64)
+    x = torch.randn(1, 6, 64, 64)
     outs = model(x)
     assert len(outs) == 3
     assert outs[0].shape == (1, 64, 64, 64)
@@ -503,8 +515,9 @@ def test_cls_token_output_shape():
         num_superpixels=16,
         with_cls_token=True,
         output_cls_token=True,
+        in_chans=6,
     )
-    x = torch.randn(1, 3, 64, 64)
+    x = torch.randn(1, 6, 64, 64)
     outs = model(x)
     assert isinstance(outs[0], tuple)
     assert outs[0][0].shape == (1, 64, 64, 64)  # feature map
@@ -521,8 +534,9 @@ def test_non_square_input():
         num_heads=1,
         depth=2,
         num_superpixels=8,
+        in_chans=6,
     )
-    x = torch.randn(1, 3, 48, 96)  # non-square
+    x = torch.randn(1, 6, 48, 96)  # non-square
     outs = model(x)
     assert outs[0].shape == (1, 64, 48, 96)
     assert torch.isfinite(outs[0]).all()
@@ -538,8 +552,9 @@ def test_minimal_depth():
         depth=_TINY_CONFIG["depth"],
         num_superpixels=_TINY_CONFIG["num_superpixels"],
         diff_slic_iters=_TINY_CONFIG["diff_slic_iters"],
+        in_chans=_TINY_CONFIG["in_chans"],
     )
-    x = torch.randn(1, 3, 32, 32)
+    x = torch.randn(1, 6, 32, 32)
     outs = model(x)
     assert len(outs) == 1
     assert torch.isfinite(outs[0]).all()
@@ -555,8 +570,9 @@ def test_gradient_flow_end_to_end():
         depth=1,
         num_superpixels=4,
         diff_slic_iters=1,
+        in_chans=6,
     )
-    x = torch.randn(1, 3, 32, 32, requires_grad=True)
+    x = torch.randn(1, 6, 32, 32, requires_grad=True)
     outs = model(x)
     loss = outs[0].sum()
     loss.backward()
@@ -572,8 +588,9 @@ def test_deterministic_across_calls():
         num_heads=1,
         depth=2,
         num_superpixels=16,
+        in_chans=6,
     )
-    x = torch.randn(1, 3, 64, 64)
+    x = torch.randn(1, 6, 64, 64)
     out1 = model(x)
     out2 = model(x)
     for o1, o2 in zip(out1, out2):

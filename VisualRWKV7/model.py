@@ -318,12 +318,16 @@ class SuperpixelEmbedding(nn.Module):
         assert mode in ("hard", "soft"), "mode must be 'hard' or 'soft'"
         self.num_superpixels = num_superpixels
         self.mode = mode
-        self.proj = nn.Linear(in_chans, embed_dims)
+        self.conv = nn.Conv2d(in_chans, embed_dims, kernel_size=3, padding=1)
+        self.proj = nn.Linear(embed_dims, embed_dims)
         self.norm = nn.LayerNorm(embed_dims)
 
     def forward(self, x: torch.Tensor, sp_map: torch.Tensor) -> torch.Tensor:
-        B, C, H, W = x.shape
+        # 1. Feature Extraction (Convolution)
+        x = self.conv(x)
+        # New shape: [B, embed_dims, H, W]
 
+        # 2. Aggregation (Adaptive Average Pool over superpixel area)
         if self.mode == "hard":
             K = max(int(sp_map.max().item() + 1), self.num_superpixels)
             mask = F.one_hot(sp_map.long(), num_classes=K).permute(0, 3, 1, 2).float()
@@ -331,7 +335,9 @@ class SuperpixelEmbedding(nn.Module):
             mask = sp_map
 
         weights = mask / (mask.sum(dim=(2, 3), keepdim=True) + 1e-6)
-        sp_features = torch.einsum("bkhw,bchw->bkc", weights, x)
+        sp_features = torch.einsum("bkhw,bdhw->bkd", weights, x)
+
+        # 3. Final Projection
         return self.norm(self.proj(sp_features))
 
 
@@ -346,7 +352,7 @@ class Vision_RWKV7(nn.Module):
     def __init__(
         self,
         img_size: int = 224,
-        in_chans: int = 3,
+        in_chans: int = 6,
         embed_dims: int = 192,
         num_heads: int = 3,
         depth: int = 12,
@@ -358,12 +364,14 @@ class Vision_RWKV7(nn.Module):
         output_cls_token: bool = False,
         num_superpixels: int = 196,
         diff_slic_iters: int = 5,
+        compactness: float = 0.5,
     ):
         super().__init__()
         self.embed_dims = embed_dims
         self.num_layers = depth
         self.with_cls_token = with_cls_token
         self.output_cls_token = output_cls_token
+        self.compactness = compactness
 
         # 1. Differentiable SLIC for dynamic superpixel generation
         self.diff_slic = DiffSLIC(
@@ -378,6 +386,7 @@ class Vision_RWKV7(nn.Module):
         self.patch_embed = SuperpixelEmbedding(
             in_chans, embed_dims, num_superpixels, mode="hard"
         )
+        self.in_chans = in_chans
 
         # 3. 1D Positional Embedding (Size is K, we add a buffer just in case K varies slightly by aspect ratio)
         self.max_K = num_superpixels + 16
@@ -441,22 +450,49 @@ class Vision_RWKV7(nn.Module):
         B, C, H, W = x.shape
 
         # ---------------------------------------------------------
-        # 1. Generate Superpixels via diffSLIC (5D Spatio-Color Space)
+        # 1. Generate Superpixels via diffSLIC
         # ---------------------------------------------------------
-        # Create normalized XY spatial grid in [-1, 1]
-        grid_y, grid_x = torch.meshgrid(
-            torch.linspace(-1, 1, H, device=x.device),
-            torch.linspace(-1, 1, W, device=x.device),
-            indexing="ij",
-        )
-        coords = torch.stack([grid_x, grid_y], dim=0).unsqueeze(0).expand(B, -1, -1, -1)
+        if C == 6:
+            # Full pipeline input: (L, a, b, alpha, x, y)
+            # We use it directly for diffSLIC.
+            model_input = x
+        else:
+            # Legacy/Fallback: RGB or RGBA input
+            # Automatically apply the balanced pipeline internally
+            from .utils.data import prepare_balanced_superpixel_features
+            if C == 4:
+                srgb = x[:, :3, :, :]
+                alpha = x[:, 3:4, :, :]
+            else:
+                srgb = x
+                alpha = None
+            model_input = prepare_balanced_superpixel_features(srgb, alpha=alpha)
 
-        # Map RGB from [0, 1] to [-1, 1] to avoid zero-norm division on black backgrounds
-        x_scaled = x * 2.0 - 1.0
+        # Apply compactness scaling to the spatial channels for diffSLIC
+        slic_input = model_input.clone()
+        slic_input[:, 4:6, :, :] *= self.compactness
 
-        # Concatenate Color (3) + Space (2) = 5 dimensions.
-        # 0.5 multiplier on coords biases toward color edges over grid rigidity.
-        slic_input = torch.cat([x_scaled, coords * 0.5], dim=1)
+        # Ensure patch_embed conv matches model_input channels
+        if model_input.shape[1] != self.patch_embed.conv.in_channels:
+            with torch.no_grad():
+                new_conv = nn.Conv2d(
+                    model_input.shape[1],
+                    self.patch_embed.conv.out_channels,
+                    kernel_size=self.patch_embed.conv.kernel_size,
+                    padding=self.patch_embed.conv.padding,
+                    device=model_input.device,
+                )
+                # Simple heuristic: copy available channels or repeat
+                old_weight = self.patch_embed.conv.weight
+                if model_input.shape[1] > old_weight.shape[1]:
+                    # Repeat channels if we have more input channels than weights
+                    repeats = (model_input.shape[1] + old_weight.shape[1] - 1) // old_weight.shape[1]
+                    new_weight = old_weight.repeat(1, repeats, 1, 1)[:, :model_input.shape[1], :, :]
+                else:
+                    new_weight = old_weight[:, :model_input.shape[1], :, :]
+                new_conv.weight.copy_(new_weight)
+                new_conv.bias.copy_(self.patch_embed.conv.bias)
+                self.patch_embed.conv = new_conv
 
         clst_feats, p2s_assign, _ = self.diff_slic(slic_input)
         h_s, w_s = clst_feats.shape[-2:]
@@ -489,7 +525,7 @@ class Vision_RWKV7(nn.Module):
                 .squeeze(1)
                 .long()
             )
-            tokens = self.patch_embed(x, global_labels)
+            tokens = self.patch_embed(model_input, global_labels)
 
         else:
             # SOFT MODE: Bypass argmax! Create one-hot superpixel IDs [1, K, H_s, W_s]
@@ -502,12 +538,12 @@ class Vision_RWKV7(nn.Module):
 
             # Upsample using the raw local soft assignments (p2s_assign) directly.
             # Because spixel_ids is one-hot, spixel_upsampling will output a global
-            # soft probability map of shape [B, K, H, W].
+            # soft mask [B, K, H, W] where mask[b, k, h, w] is the probability
+            # that pixel (h, w) belongs to superpixel k.
             global_soft_mask = spixel_upsampling(
                 spixel_ids, p2s_assign, candidate_radius=radius
             )
-
-            tokens = self.patch_embed(x, global_soft_mask)
+            tokens = self.patch_embed(model_input, global_soft_mask)
 
         # Add 1D positional embedding
         tokens = tokens + self.pos_embed[:, :K, :]

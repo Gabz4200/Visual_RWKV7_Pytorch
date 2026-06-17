@@ -5,25 +5,26 @@ import numpy as np
 from skimage import data, segmentation
 
 from VisualRWKV7 import DiffSLIC, spixel_upsampling, build_knn_graph, q_shift_graph_multihead, Vision_RWKV7
+from VisualRWKV7.utils.data import prepare_balanced_superpixel_features, preprocess_image_for_rwkv7
 
 
 def visualize_superpixels_and_graph(img_np, img_tensor, ax):
     """Visualizes diffSLIC superpixels, centroids, and the K-NN graph."""
     n_spixels = 150
+    compactness = 0.5
     diff_slic = DiffSLIC(n_spixels=n_spixels, n_iter=10, tau=0.01, candidate_radius=1)
 
     with torch.no_grad():
-        B, _, H, W = img_tensor.shape
-        grid_y, grid_x = torch.meshgrid(
-            torch.linspace(-1, 1, H, device=img_tensor.device),
-            torch.linspace(-1, 1, W, device=img_tensor.device),
-            indexing="ij",
-        )
-        coords = torch.stack([grid_x, grid_y], dim=0).unsqueeze(0).expand(B, -1, -1, -1)
+        B, C, H, W = img_tensor.shape
+        # Use the balanced pipeline
+        if C == 3:
+            model_input = prepare_balanced_superpixel_features(img_tensor)
+        else:
+            model_input = img_tensor
 
-        # Scale to [-1, 1] and concatenate (RGB + XY)
-        img_scaled = img_tensor * 2.0 - 1.0
-        slic_input = torch.cat([img_scaled, coords * 0.5], dim=1)
+        # Apply compactness scaling to the spatial channels for diffSLIC
+        slic_input = model_input.clone()
+        slic_input[:, 4:6, :, :] *= compactness
 
         clst_feats, p2s_assign, _ = diff_slic(slic_input)
 
@@ -86,17 +87,15 @@ def visualize_superpixels_and_graph(img_np, img_tensor, ax):
 
 def visualize_conv_features(img_tensor, model, ax):
     """Visualizes the feature maps output by the initial Conv2d Patch Embedder."""
-    # Resize to model's expected input size for this demo
-    img_resized = F.interpolate(
-        img_tensor, size=(224, 224), mode="bilinear", align_corners=False
-    )
-
+    # Use the full pipeline to get balanced features
     with torch.no_grad():
-        # Apply the Linear projection on the image pixels directly to visualize feature extraction
-        img_reshaped = img_resized.permute(0, 2, 3, 1)  # [1, H, W, 3]
-        features = model.patch_embed.proj(img_reshaped).permute(
-            0, 3, 1, 2
-        )  # Shape: [1, embed_dims, H', W']
+        balanced_features = prepare_balanced_superpixel_features(img_tensor)
+        # Resize to model's expected input size for this demo
+        features_input = F.interpolate(
+            balanced_features, size=(224, 224), mode="bilinear", align_corners=False
+        )
+        # Apply the Conv layer
+        features = model.patch_embed.conv(features_input)
 
     features = features.squeeze(0).cpu().numpy()  # [C, H', W']
 
@@ -215,18 +214,13 @@ if __name__ == "__main__":
     visualize_superpixels_and_graph(img_resized_np, img_resized_tensor, ax1)
 
     print("Generating Convolutional Feature Map Visualization...")
-    # We pass ax2 to a modified version that plots inside the grid,
-    # but for simplicity, we'll call the dedicated function which opens its own window,
-    # OR we can adapt it. Let's adapt it to plot in ax2.
-
     # --- Inline Conv Feature Viz ---
-    img_resized = F.interpolate(
-        img_tensor, size=(224, 224), mode="bilinear", align_corners=False
-    )
     with torch.no_grad():
-        # Apply the Linear projection on the image pixels directly
-        img_reshaped = img_resized.permute(0, 2, 3, 1)  # [1, H, W, 3]
-        features = model.patch_embed.proj(img_reshaped).permute(0, 3, 1, 2)
+        balanced_features = prepare_balanced_superpixel_features(img_tensor)
+        features_input = F.interpolate(
+            balanced_features, size=(224, 224), mode="bilinear", align_corners=False
+        )
+        features = model.patch_embed.conv(features_input)
         features = features.squeeze(0).cpu().numpy()
     features_norm = (features - features.min(axis=(1, 2), keepdims=True)) / (
         features.max(axis=(1, 2), keepdims=True)

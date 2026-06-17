@@ -16,6 +16,10 @@ from VisualRWKV7.utils.data import (
     _convert_srgb_to_oklab,
     calculate_dataset_mean_std,
     load_image_to_tensor,
+    add_spatial_coordinates,
+    preprocess_image_for_rwkv7,
+    prepare_balanced_superpixel_features,
+    revert_balanced_superpixel_features,
 )
 
 # =============================================================================
@@ -54,11 +58,11 @@ def create_dummy_dataset(
 
 
 def test_default_constants_shapes():
-    """Verify that all default normalization constants are lists of length 3."""
-    assert len(IMAGENET_RGB_MEAN) == 3
-    assert len(IMAGENET_RGB_STD) == 3
-    assert len(DEFAULT_OKLAB_MEAN) == 3
-    assert len(DEFAULT_OKLAB_STD) == 3
+    """Verify that all default normalization constants are lists of length 4."""
+    assert len(IMAGENET_RGB_MEAN) == 4
+    assert len(IMAGENET_RGB_STD) == 4
+    assert len(DEFAULT_OKLAB_MEAN) == 4
+    assert len(DEFAULT_OKLAB_STD) == 4
 
 
 def test_convert_srgb_to_oklab_ranges():
@@ -78,6 +82,12 @@ def test_convert_srgb_to_oklab_ranges():
     # a and b (color opponents) should be roughly in [-0.5, 0.5] for in-gamut sRGB
     assert (a >= -0.6).all() and (a <= 0.6).all()
     assert (b >= -0.6).all() and (b <= 0.6).all()
+
+    # Test RGBA
+    rgba = torch.rand(2, 4, 32, 32)
+    oklab_rgba = _convert_srgb_to_oklab(rgba)
+    assert oklab_rgba.shape == rgba.shape
+    assert torch.allclose(oklab_rgba[:, 3:4, :, :], rgba[:, 3:4, :, :])
 
 
 # =============================================================================
@@ -153,6 +163,29 @@ def test_load_image_custom_mean_std(tmp_path):
     assert (tensor.abs() < 0.1).all()
 
 
+def test_load_image_rgba(tmp_path):
+    """Verify loading with include_alpha=True returns (1, 4, H, W) tensor."""
+    img_path = tmp_path / "test.png"
+    # Create an RGBA image
+    img = Image.new("RGBA", (100, 200), (255, 0, 0, 128))
+    img.save(img_path)
+
+    tensor = load_image_to_tensor(str(img_path), include_alpha=True)
+
+    assert tensor.shape == (1, 4, 200, 100)
+    assert torch.allclose(tensor[:, 3, :, :], torch.full((1, 200, 100), 128 / 255.0))
+
+    # Test normalization with alpha
+    tensor_norm = load_image_to_tensor(str(img_path), include_alpha=True, normalize=True)
+    assert tensor_norm.shape == (1, 4, 200, 100)
+    assert torch.isfinite(tensor_norm).all()
+
+    # Test OkLAB with alpha
+    tensor_oklab = load_image_to_tensor(str(img_path), include_alpha=True, color_space="oklab")
+    assert tensor_oklab.shape == (1, 4, 200, 100)
+    assert torch.allclose(tensor_oklab[:, 3, :, :], torch.full((1, 200, 100), 128 / 255.0))
+
+
 def test_load_image_invalid_color_space(tmp_path):
     """Verify invalid color_space raises ValueError."""
     img_path = tmp_path / "test.jpg"
@@ -178,8 +211,158 @@ def test_load_image_handles_rgba_and_grayscale(tmp_path):
 
 
 # =============================================================================
+# add_spatial_coordinates Tests
+# =============================================================================
+
+
+def test_add_spatial_coordinates_shape():
+    """Verify that spatial coordinates add 2 channels."""
+    batch = torch.randn(2, 3, 32, 64)
+    out = add_spatial_coordinates(batch)
+    assert out.shape == (2, 5, 32, 64)
+
+
+def test_add_spatial_coordinates_values_centered():
+    """Verify centered spatial coordinates map to [-1, 1]."""
+    batch = torch.zeros(1, 1, 4, 4)
+    out = add_spatial_coordinates(batch, center_origin=True)
+
+    x_chan = out[0, 1, :, :]
+    y_chan = out[0, 2, :, :]
+
+    # Check corners
+    assert torch.allclose(x_chan[:, 0], torch.tensor(-1.0))
+    assert torch.allclose(x_chan[:, -1], torch.tensor(1.0))
+    assert torch.allclose(y_chan[0, :], torch.tensor(-1.0))
+    assert torch.allclose(y_chan[-1, :], torch.tensor(1.0))
+
+    # Check that x varies across columns, y across rows
+    assert torch.allclose(x_chan[0, :], x_chan[1, :])
+    assert torch.allclose(y_chan[:, 0], y_chan[:, 1])
+
+
+def test_add_spatial_coordinates_values_topleft():
+    """Verify top-left spatial coordinates map to [0, 1]."""
+    batch = torch.zeros(1, 1, 4, 4)
+    out = add_spatial_coordinates(batch, center_origin=False)
+
+    x_chan = out[0, 1, :, :]
+    y_chan = out[0, 2, :, :]
+
+    assert torch.allclose(x_chan[:, 0], torch.tensor(0.0))
+    assert torch.allclose(x_chan[:, -1], torch.tensor(1.0))
+    assert torch.allclose(y_chan[0, :], torch.tensor(0.0))
+    assert torch.allclose(y_chan[-1, :], torch.tensor(1.0))
+
+
+# =============================================================================
+# preprocess_image_for_rwkv7 Tests
+# =============================================================================
+
+
+def test_preprocess_image_for_rwkv7_full_pipeline(tmp_path):
+    """Verify the full 6-channel pipeline (L, a, b, alpha, x, y)."""
+    img_path = tmp_path / "test_rgba.png"
+    # Create an RGBA image
+    Image.new("RGBA", (100, 200), (255, 128, 64, 200)).save(str(img_path))
+
+    # Default settings: oklab=True, include_alpha=True, center_origin=True
+    tensor = preprocess_image_for_rwkv7(str(img_path), target_size=(224, 224))
+
+    # Shape: (1, 6, H, W)
+    assert tensor.shape == (1, 6, 224, 224)
+
+    L, a, b, alpha, x, y = [tensor[0, i] for i in range(6)]
+
+    # 1. Check alpha (channel 3)
+    # 200 / 255.0 ≈ 0.7843
+    # Balanced with 2.0 * alpha - 1.0 -> 2.0 * 0.7843 - 1.0 = 0.5686
+    expected_alpha = 2.0 * (200 / 255.0) - 1.0
+    assert torch.allclose(alpha, torch.full_like(alpha, expected_alpha))
+
+    # 2. Check spatial coordinates (channels 4, 5)
+    assert x.min() == -1.0
+    assert x.max() == 1.0
+    assert y.min() == -1.0
+    assert y.max() == 1.0
+
+    # 3. Check color channels (L, a, b)
+    # Just ensure they are finite and L is roughly in [0, 1]
+    assert torch.isfinite(L).all()
+    assert torch.isfinite(a).all()
+    assert torch.isfinite(b).all()
+    assert L.mean() > 0  # Not a black image
+
+
+def test_preprocess_image_for_rwkv7_no_alpha(tmp_path):
+    """Verify pipeline without alpha still returns 6 channels (L, a, b, alpha, x, y)."""
+    img_path = tmp_path / "test_rgb.jpg"
+    Image.new("RGB", (64, 64), (255, 255, 255)).save(str(img_path))
+
+    # include_alpha=False -> alpha defaults to 1.0 (opaque)
+    tensor = preprocess_image_for_rwkv7(
+        str(img_path), target_size=(32, 32), include_alpha=False
+    )
+
+    # Shape: (1, 6, H, W) -> L, a, b, alpha, x, y
+    assert tensor.shape == (1, 6, 32, 32)
+    # Alpha (channel 3) should be 1.0 (2.0 * 1.0 - 1.0 = 1.0)
+    assert torch.allclose(tensor[0, 3], torch.tensor(1.0))
+    # Last two should be x, y
+    assert tensor[0, 4].min() == -1.0
+    assert tensor[0, 5].max() == 1.0
+
+
+# =============================================================================
 # calculate_dataset_mean_std Tests
 # =============================================================================
+
+
+def test_revert_balanced_superpixel_features_roundtrip():
+    """Verify that balancing and reverting is a lossless round-trip operation."""
+    B, H, W = 2, 32, 32
+    # Create random OkLAB-like data
+    L = torch.rand(B, 1, H, W)
+    a = (torch.rand(B, 1, H, W) - 0.5) * 0.8  # ~[-0.4, 0.4]
+    b = (torch.rand(B, 1, H, W) - 0.5) * 0.8
+    alpha = torch.rand(B, 1, H, W)
+
+    # 1. Test the math directly
+    L_bal = 2.0 * L - 1.0
+    alpha_bal = 2.0 * alpha - 1.0
+    chroma_scale = 2.5
+    a_bal = a * chroma_scale
+    b_bal = b * chroma_scale
+    x = torch.zeros(B, 1, H, W)
+    y = torch.zeros(B, 1, H, W)
+    
+    balanced = torch.cat([L_bal, a_bal, b_bal, alpha_bal, x, y], dim=1)
+    
+    # 2. Revert
+    oklab_rev, alpha_rev = revert_balanced_superpixel_features(balanced, chroma_scale=chroma_scale)
+    
+    # 3. Assertions
+    assert torch.allclose(oklab_rev[:, 0:1], L, atol=1e-6)
+    assert torch.allclose(oklab_rev[:, 1:2], a, atol=1e-6)
+    assert torch.allclose(oklab_rev[:, 2:3], b, atol=1e-6)
+    assert torch.allclose(alpha_rev, alpha, atol=1e-6)
+
+
+def test_prepare_balanced_superpixel_features_integration():
+    """Verify integration of prepare_balanced_superpixel_features."""
+    B, H, W = 1, 16, 16
+    srgb = torch.rand(B, 3, H, W)
+    alpha = torch.rand(B, 1, H, W)
+    
+    balanced = prepare_balanced_superpixel_features(srgb, alpha=alpha)
+    assert balanced.shape == (B, 6, H, W)
+    
+    # Check if L_bal is in [-1, 1]
+    assert (balanced[:, 0] >= -1.0001).all() and (balanced[:, 0] <= 1.0001).all()
+    # Check if alpha_bal is in [-1, 1]
+    assert (balanced[:, 3] >= -1.0001).all() and (balanced[:, 3] <= 1.0001).all()
+    # Check if x, y are in [-1, 1]
+    assert (balanced[:, 4:] >= -1.0001).all() and (balanced[:, 4:] <= 1.0001).all()
 
 
 def test_calculate_dataset_mean_std_rgb_uniform(tmp_path):
