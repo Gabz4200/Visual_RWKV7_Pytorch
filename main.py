@@ -15,58 +15,59 @@ def main():
 
     torch.set_default_device(TORCH_DEVICE)
 
-    for seed in seeds:
-        torch.manual_seed(seed)
-        print(f"\n=== Testing seed {seed} ===")
+    with torch.no_grad():
+        for seed in seeds:
+            torch.manual_seed(seed)
+            print(f"\n=== Testing seed {seed} ===")
 
-        # Initialize the new Vision-RWKV-7 with Superpixel Tokenization (diffSLIC)
-        model = Vision_RWKV7(
-            img_size=64,
-            in_chans=3,
-            embed_dims=192,
-            num_heads=3,
-            depth=12,
-            init_values=1e-5,
-            final_norm=True,
-            out_indices=[3, 5, 7, 11],
-            num_superpixels=196,  # Target number of superpixels (approx 14x14 grid)
-            diff_slic_iters=5,  # Number of iterations for diffSLIC optimization
-        )
+            # Initialize the new Vision-RWKV-7 with Superpixel Tokenization (diffSLIC)
+            model = Vision_RWKV7(
+                img_size=64,
+                in_chans=3,
+                embed_dims=192,
+                num_heads=3,
+                depth=12,
+                init_values=1e-5,
+                final_norm=True,
+                out_indices=[3, 5, 7, 11],
+                num_superpixels=196,  # Target number of superpixels (approx 14x14 grid)
+                diff_slic_iters=5,  # Number of iterations for diffSLIC optimization
+            )
 
-        # Dummy image input
-        x = load_image_to_tensor(
-            "test_image_from_slirack_pinterest.jpg",
-            color_space="oklab",
-            target_size=(64, 64),
-            normalize=True,
-        )
+            # Dummy image input
+            x = load_image_to_tensor(
+                "test_image_from_slirack_pinterest.jpg",
+                color_space="oklab",
+                target_size=(64, 64),
+                normalize=True,
+            )
 
-        # Forward pass
-        outs = model(x)
+            # Forward pass
+            outs = model(x)
 
-        print(f"Input:  {tuple(x.shape)}")
-        print(f"Output levels:  {len(outs)}")
-        for i, o in enumerate(outs):
-            print(f"  level {i}: {tuple(o.shape)}")
+            print(f"Input:  {tuple(x.shape)}")
+            print(f"Output levels:  {len(outs)}")
+            for i, o in enumerate(outs):
+                print(f"  level {i}: {tuple(o.shape)}")
 
-        total = sum(p.numel() for p in model.parameters())
-        print(f"\nTotal params: {total / 1e6:.2f}M")
+            total = sum(p.numel() for p in model.parameters())
+            print(f"\nTotal params: {total / 1e6:.2f}M")
 
-        # Verify no NaN/Inf
-        all_finite = all(o.isfinite().all() for o in outs)
-        print(f"All outputs finite: {all_finite}")
+            # Verify no NaN/Inf
+            all_finite = all(o.isfinite().all() for o in outs)
+            print(f"All outputs finite: {all_finite}")
 
-        # Verify deterministic: same input -> same output
-        outs2 = model(x)
-        deterministic = all(
-            (o1 - o2).abs().max().item() < 1e-5 for o1, o2 in zip(outs, outs2)
-        )
-        print(f"Deterministic: {deterministic}")
+            # Verify deterministic: same input -> same output
+            outs2 = model(x)
+            deterministic = all(
+                (o1 - o2).abs().max().item() < 1e-5 for o1, o2 in zip(outs, outs2)
+            )
+            print(f"Deterministic: {deterministic}")
 
-        # Cleanup Memory
-        del model, x, outs, outs2
-        if TORCH_DEVICE == "cuda":
-            torch.cuda.empty_cache()
+            # Cleanup Memory
+            del model, x, outs, outs2
+            if TORCH_DEVICE == "cuda":
+                torch.cuda.empty_cache()
 
 
 if __name__ == "__main__":
