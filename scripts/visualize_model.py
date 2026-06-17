@@ -17,10 +17,22 @@ from VisualRWKV7.model import (
 def visualize_superpixels_and_graph(img_np, img_tensor, ax):
     """Visualizes diffSLIC superpixels, centroids, and the K-NN graph."""
     n_spixels = 150
-    diff_slic = DiffSLIC(n_spixels=n_spixels, n_iter=5, tau=0.01, candidate_radius=1)
+    diff_slic = DiffSLIC(n_spixels=n_spixels, n_iter=10, tau=0.01, candidate_radius=1)
 
     with torch.no_grad():
-        clst_feats, p2s_assign, _ = diff_slic(img_tensor)
+        B, C, H, W = img_tensor.shape
+        grid_y, grid_x = torch.meshgrid(
+            torch.linspace(-1, 1, H, device=img_tensor.device),
+            torch.linspace(-1, 1, W, device=img_tensor.device),
+            indexing="ij",
+        )
+        coords = torch.stack([grid_x, grid_y], dim=0).unsqueeze(0).expand(B, -1, -1, -1)
+
+        # Scale to [-1, 1] and concatenate (RGB + XY)
+        img_scaled = img_tensor * 2.0 - 1.0
+        slic_input = torch.cat([img_scaled, coords * 0.5], dim=1)
+
+        clst_feats, p2s_assign, _ = diff_slic(slic_input)
 
     # Replicate the hard label upsampling from Vision_RWKV7.forward
     radius = diff_slic.candidate_radius
@@ -201,7 +213,13 @@ if __name__ == "__main__":
     ax4 = fig.add_subplot(gs[1, :])  # Spans the whole bottom row
 
     print("Generating Superpixel & Graph Visualization...")
-    visualize_superpixels_and_graph(img_np, img_tensor, ax1)
+    # Redimensiona para 224x224 ANTES de enviar para os superpixels, combinando com a escala do modelo
+    img_resized_tensor = F.interpolate(
+        img_tensor, size=(224, 224), mode="bilinear", align_corners=False
+    )
+    img_resized_np = img_resized_tensor.squeeze(0).permute(1, 2, 0).cpu().numpy()
+
+    visualize_superpixels_and_graph(img_resized_np, img_resized_tensor, ax1)
 
     print("Generating Convolutional Feature Map Visualization...")
     # We pass ax2 to a modified version that plots inside the grid,
@@ -223,11 +241,21 @@ if __name__ == "__main__":
         + 1e-8
     )
 
-    # Plot first 4 channels in the top row
+    # Create a 2x2 sub-grid in the remaining space of the top row (columns 1 and 2)
+    sub_gs = gs[0, 1:3].subgridspec(2, 2)
+
+    # Hide the old unused axes borders
+    ax2.axis("off")
+    ax3.axis("off")
+
     for i in range(4):
-        ax = fig.add_subplot(gs[0, i])  # Use the top row gridspec
+        # Math trick to get 0,0 0,1 1,0 1,1 coordinates for the 2x2 sub-grid
+        row = i // 2
+        col = i % 2
+
+        ax = fig.add_subplot(sub_gs[row, col])
         ax.imshow(features_norm[i], cmap="magma")
-        ax.set_title(f"Conv2d Feature Ch {i}", fontsize=9)
+        ax.set_title(f"Conv Feature Ch {i}", fontsize=8)
         ax.axis("off")
 
     print("Generating Q-Shift Mechanics Visualization...")
@@ -292,8 +320,11 @@ if __name__ == "__main__":
         "Vision-RWKV-7 Internal Mechanics Visualization",
         fontsize=16,
         fontweight="bold",
-        y=0.98,
+        y=0.995,
     )
-    plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+    # Ajuste manual preciso para evitar sobreposição
+    plt.subplots_adjust(
+        top=0.88, bottom=0.08, left=0.05, right=0.95, hspace=0.35, wspace=0.25
+    )
     plt.show()
     print("Visualization complete!")

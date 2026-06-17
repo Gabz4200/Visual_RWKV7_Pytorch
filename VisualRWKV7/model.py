@@ -435,7 +435,7 @@ class SuperpixelEmbedding(nn.Module):
     """Convert 2D image to superpixel tokens via mask-based aggregation."""
 
     def __init__(
-        self, in_chans: int, embed_dims: int, num_superpixels: int, mode: str = "hard"
+        self, in_chans: int, embed_dims: int, num_superpixels: int, mode: str = "soft"
     ):
         super().__init__()
         assert mode in ("hard", "soft"), "mode must be 'hard' or 'soft'"
@@ -548,9 +548,24 @@ class Vision_RWKV7(nn.Module):
         B, C, H, W = x.shape
 
         # ---------------------------------------------------------
-        # 1. Generate Superpixels via diffSLIC
+        # 1. Generate Superpixels via diffSLIC (5D Spatio-Color Space)
         # ---------------------------------------------------------
-        clst_feats, p2s_assign, _ = self.diff_slic(x)
+        # Cria uma grade espacial XY normalizada entre -1 e 1
+        grid_y, grid_x = torch.meshgrid(
+            torch.linspace(-1, 1, H, device=x.device),
+            torch.linspace(-1, 1, W, device=x.device),
+            indexing="ij",
+        )
+        coords = torch.stack([grid_x, grid_y], dim=0).unsqueeze(0).expand(B, -1, -1, -1)
+
+        # Mapeia RGB de [0, 1] para [-1, 1] para evitar divisão por zero no L2 norm do fundo preto
+        x_scaled = x * 2.0 - 1.0
+
+        # Concatena Cor (3) + Espaço (2) = 5 Dimensões.
+        # Multiplicador 0.5 em coords prioriza as bordas de cor sobre a rigidez da grade.
+        slic_input = torch.cat([x_scaled, coords * 0.5], dim=1)
+
+        clst_feats, p2s_assign, _ = self.diff_slic(slic_input)
         h_s, w_s = clst_feats.shape[-2:]
         K = h_s * w_s
         radius = self.diff_slic.candidate_radius
