@@ -4,7 +4,9 @@ import torch
 import torch.nn as nn
 
 
-def drop_path(x: torch.Tensor, drop_prob: float = 0.0, training: bool = False) -> torch.Tensor:
+def drop_path(
+    x: torch.Tensor, drop_prob: float = 0.0, training: bool = False
+) -> torch.Tensor:
     """Drop paths (Stochastic Depth) per sample (applied to main path of residual blocks)."""
     if drop_prob == 0.0 or not training:
         return x
@@ -17,6 +19,7 @@ def drop_path(x: torch.Tensor, drop_prob: float = 0.0, training: bool = False) -
 
 class DropPath(nn.Module):
     """Drop paths (Stochastic Depth) per sample."""
+
     __slots__ = ("drop_prob",)
 
     def __init__(self, drop_prob: float = 0.0):

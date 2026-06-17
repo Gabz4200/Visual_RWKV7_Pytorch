@@ -7,9 +7,10 @@ import torch.nn.functional as F
 from typing import Optional, Sequence, Tuple
 
 # Import diffSLIC components from the same directory
-from .diffSLIC import DiffSLIC, spixel_upsampling
-from .graph import build_knn_graph, q_shift_graph_multihead, HEAD_SIZE
-from .drop import DropPath
+from .diffSLIC import DiffSLIC
+from .utils.diffSLIC_funcs import spixel_upsampling
+from .utils.graph import build_knn_graph, q_shift_graph_multihead, HEAD_SIZE
+from .utils.drop import DropPath
 
 TIME_MIX_EXTRA_DIM = 32
 
@@ -389,7 +390,13 @@ class Vision_RWKV7(nn.Module):
         self.blocks = nn.ModuleList(
             [
                 Vision_RWKV7_Block(
-                    embed_dims, num_heads, depth, i, drop_prob=dpr[i], init_values=init_values, with_cls_token=with_cls_token
+                    embed_dims,
+                    num_heads,
+                    depth,
+                    i,
+                    drop_prob=dpr[i],
+                    init_values=init_values,
+                    with_cls_token=with_cls_token,
                 )
                 for i in range(depth)
             ]
@@ -511,9 +518,7 @@ class Vision_RWKV7(nn.Module):
             mask = global_soft_mask
         else:
             assert global_labels is not None
-            mask = (
-                F.one_hot(global_labels, num_classes=K).permute(0, 3, 1, 2).float()
-            )
+            mask = F.one_hot(global_labels, num_classes=K).permute(0, 3, 1, 2).float()
         centroids = self._compute_centroids(mask)
 
         # Build Graph

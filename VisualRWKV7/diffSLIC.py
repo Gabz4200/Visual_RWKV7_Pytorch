@@ -5,11 +5,9 @@ import torch.nn as nn
 import math
 import torch.nn.functional as F
 
-from .diffSLIC_funcs import (
+from .utils.diffSLIC_funcs import (
     compute_elem_to_center_assignment,
     update_clst_feats,
-    spixel_upsampling,
-    spixel_downsampling,
 )
 
 
@@ -78,7 +76,9 @@ class DiffSLIC(nn.Module):
         # normalize feature vectors so that their l2-norm is 1
         if self.normalize:
             x = x / x.norm(dim=1, keepdim=True).clamp(min=1e-8)
-            clst_feats = clst_feats / clst_feats.norm(dim=1, keepdim=True).clamp(min=1e-8)
+            clst_feats = clst_feats / clst_feats.norm(dim=1, keepdim=True).clamp(
+                min=1e-8
+            )
         # padding an image feature so that its height and width are divisible by stride values
         pad_x = (width_s - width % width_s) % width_s
         pad_y = (height_s - height % height_s) % height_s
@@ -90,7 +90,9 @@ class DiffSLIC(nn.Module):
                 x, clst_feats, stride, self.tau, self.candidate_radius
             )
             if self.normalize:
-                clst_feats = clst_feats / clst_feats.norm(dim=1, keepdim=True).clamp(min=1e-8)
+                clst_feats = clst_feats / clst_feats.norm(dim=1, keepdim=True).clamp(
+                    min=1e-8
+                )
         # compute a pixel-to-superpixel assignment
         p2s_assign, _ = compute_elem_to_center_assignment(
             clst_feats, x, stride, self.tau, self.candidate_radius

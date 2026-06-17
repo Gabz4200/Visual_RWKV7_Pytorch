@@ -21,7 +21,9 @@ def _masked_softmax(
     """
     similarities = torch.where(similarities == 0, FILLER, similarities)
     if stable:
-        similarities = similarities - similarities.max(dim, keepdim=True).values.detach()
+        similarities = (
+            similarities - similarities.max(dim, keepdim=True).values.detach()
+        )
     return (similarities / tau).softmax(dim)
 
 

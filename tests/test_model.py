@@ -22,8 +22,22 @@ def get_dummy_neighbors(B, N, K=4):
 
 
 # Common small model configs to reduce duplication across tests
-_TINY_CONFIG = dict(img_size=32, embed_dims=64, num_heads=1, depth=1, num_superpixels=9, diff_slic_iters=2)
-_SMALL_CONFIG = dict(img_size=64, embed_dims=64, num_heads=1, depth=2, num_superpixels=16, diff_slic_iters=2)
+_TINY_CONFIG = dict(
+    img_size=32,
+    embed_dims=64,
+    num_heads=1,
+    depth=1,
+    num_superpixels=9,
+    diff_slic_iters=2,
+)
+_SMALL_CONFIG = dict(
+    img_size=64,
+    embed_dims=64,
+    num_heads=1,
+    depth=2,
+    num_superpixels=16,
+    diff_slic_iters=2,
+)
 
 
 # =====================================================================

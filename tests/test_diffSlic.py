@@ -6,7 +6,7 @@ import torch.nn.functional as F
 import numpy as np
 import matplotlib.pyplot as plt
 from PIL import Image
-from VisualRWKV7.diffSLIC import DiffSLIC, spixel_upsampling, spixel_downsampling
+from VisualRWKV7 import DiffSLIC, spixel_upsampling, spixel_downsampling
 
 
 def _run_diffslic_on_multiple_images():
@@ -207,9 +207,9 @@ def label_to_rgb(labels):
     n_colors = len(unique_labels)
 
     hues = np.linspace(0, 1, n_colors, endpoint=False)
-    hsv_colors = np.stack([
-        hues, np.full(n_colors, 0.8), np.full(n_colors, 0.9)
-    ], axis=1)
+    hsv_colors = np.stack(
+        [hues, np.full(n_colors, 0.8), np.full(n_colors, 0.9)], axis=1
+    )
     rgb_colors = hsv_to_rgb(hsv_colors)
 
     idx_map = np.zeros(labels.max() + 1, dtype=int)
@@ -230,17 +230,24 @@ def test_diffslic_nan_safety_with_black_pixels():
     )
     with torch.no_grad():
         clst_feats, p2s_assign, _ = diff_slic(x)
-    assert not torch.isnan(clst_feats).any(), "clst_feats has NaN from zero-norm division"
-    assert not torch.isnan(p2s_assign).any(), "p2s_assign has NaN from zero-norm division"
+    assert not torch.isnan(clst_feats).any(), (
+        "clst_feats has NaN from zero-norm division"
+    )
+    assert not torch.isnan(p2s_assign).any(), (
+        "p2s_assign has NaN from zero-norm division"
+    )
     assert torch.isfinite(clst_feats).all(), "clst_feats has non-finite values"
 
 
-@pytest.mark.parametrize("n_spixels,n_iter,tau", [
-    (49, 5, 0.01),
-    (196, 10, 0.01),
-    (400, 15, 0.005),
-    (196, 20, 0.001),
-])
+@pytest.mark.parametrize(
+    "n_spixels,n_iter,tau",
+    [
+        (49, 5, 0.01),
+        (196, 10, 0.01),
+        (400, 15, 0.005),
+        (196, 20, 0.001),
+    ],
+)
 def test_with_different_configs(n_spixels, n_iter, tau):
     """Run diffSLIC with different hyperparameter configurations."""
     test_img = torch.randn(1, 3, 224, 224) * 0.5
@@ -260,7 +267,12 @@ def test_with_different_configs(n_spixels, n_iter, tau):
 def test_diffslic_soft_assignment_probability():
     """Verify p2s_assign sums to 1 over candidate dimension (softmax probability)."""
     diff_slic = DiffSLIC(
-        n_spixels=16, n_iter=5, tau=0.01, candidate_radius=1, normalize=True, stable=True
+        n_spixels=16,
+        n_iter=5,
+        tau=0.01,
+        candidate_radius=1,
+        normalize=True,
+        stable=True,
     )
     x = torch.randn(1, 3, 64, 64)
     with torch.no_grad():
@@ -274,21 +286,35 @@ def test_diffslic_soft_assignment_probability():
 def test_diffslic_output_shapes():
     """Check output tensor shapes for batch=2 with candidate_radius=1."""
     diff_slic = DiffSLIC(
-        n_spixels=16, n_iter=5, tau=0.01, candidate_radius=1, normalize=True,
+        n_spixels=16,
+        n_iter=5,
+        tau=0.01,
+        candidate_radius=1,
+        normalize=True,
     )
     x = torch.randn(2, 3, 64, 64)
     with torch.no_grad():
         clst_feats, p2s_assign, s2p_assign = diff_slic(x)
-    assert clst_feats.shape[0] == 2 and clst_feats.shape[1] == 3, "clst_feats batch or channel dim wrong"
-    assert clst_feats.shape[2] * clst_feats.shape[3] <= 16, "clst_feats spatial product exceeds n_spixels"
-    assert p2s_assign.shape == (2, 9, 64, 64), f"p2s_assign shape mismatch: {p2s_assign.shape}"
+    assert clst_feats.shape[0] == 2 and clst_feats.shape[1] == 3, (
+        "clst_feats batch or channel dim wrong"
+    )
+    assert clst_feats.shape[2] * clst_feats.shape[3] <= 16, (
+        "clst_feats spatial product exceeds n_spixels"
+    )
+    assert p2s_assign.shape == (2, 9, 64, 64), (
+        f"p2s_assign shape mismatch: {p2s_assign.shape}"
+    )
     assert s2p_assign is not None, "s2p_assign should not be None with n_iter=5"
 
 
 def test_diffslic_zero_iter():
     """Check s2p_assign is None and outputs are finite when n_iter=0."""
     diff_slic = DiffSLIC(
-        n_spixels=16, n_iter=0, tau=0.01, candidate_radius=1, normalize=True,
+        n_spixels=16,
+        n_iter=0,
+        tau=0.01,
+        candidate_radius=1,
+        normalize=True,
     )
     x = torch.randn(1, 3, 64, 64)
     with torch.no_grad():
@@ -301,7 +327,11 @@ def test_diffslic_zero_iter():
 def test_spixel_upsampling_shape():
     """Verify spixel_upsampling restores original spatial resolution."""
     diff_slic = DiffSLIC(
-        n_spixels=16, n_iter=3, tau=0.01, candidate_radius=1, normalize=True,
+        n_spixels=16,
+        n_iter=3,
+        tau=0.01,
+        candidate_radius=1,
+        normalize=True,
     )
     x = torch.randn(1, 3, 64, 64)
     with torch.no_grad():
@@ -315,7 +345,11 @@ def test_spixel_upsampling_shape():
 def test_spixel_downsampling_shape():
     """Verify spixel_downsampling produces spixel-resolution output."""
     diff_slic = DiffSLIC(
-        n_spixels=16, n_iter=3, tau=0.01, candidate_radius=1, normalize=True,
+        n_spixels=16,
+        n_iter=3,
+        tau=0.01,
+        candidate_radius=1,
+        normalize=True,
     )
     x = torch.randn(1, 3, 64, 64)
     with torch.no_grad():
@@ -330,7 +364,11 @@ def test_spixel_downsampling_shape():
 def test_diffslic_gradient_flow():
     """Verify gradients flow through the entire diffSLIC forward."""
     diff_slic = DiffSLIC(
-        n_spixels=16, n_iter=3, tau=0.01, candidate_radius=1, normalize=False,
+        n_spixels=16,
+        n_iter=3,
+        tau=0.01,
+        candidate_radius=1,
+        normalize=False,
     )
     x = torch.randn(1, 3, 16, 16, requires_grad=True)
     clst_feats, p2s_assign, _ = diff_slic(x)
@@ -344,12 +382,18 @@ def test_diffslic_gradient_flow():
 def test_diffslic_single_superpixel():
     """Check behaviour with a single superpixel (n_spixels=1)."""
     diff_slic = DiffSLIC(
-        n_spixels=1, n_iter=3, tau=0.01, candidate_radius=1, normalize=True,
+        n_spixels=1,
+        n_iter=3,
+        tau=0.01,
+        candidate_radius=1,
+        normalize=True,
     )
     x = torch.randn(1, 3, 32, 32)
     with torch.no_grad():
         clst_feats, p2s_assign, _ = diff_slic(x)
-    assert clst_feats.shape == (1, 3, 1, 1), f"clst_feats shape mismatch: {clst_feats.shape}"
+    assert clst_feats.shape == (1, 3, 1, 1), (
+        f"clst_feats shape mismatch: {clst_feats.shape}"
+    )
     assert torch.isfinite(clst_feats).all(), "clst_feats has non-finite values"
     assert torch.isfinite(p2s_assign).all(), "p2s_assign has non-finite values"
 
@@ -357,17 +401,29 @@ def test_diffslic_single_superpixel():
 def test_diffslic_non_square_image():
     """Check diffSLIC works on non-square images (width != height)."""
     diff_slic = DiffSLIC(
-        n_spixels=16, n_iter=3, tau=0.01, candidate_radius=1, normalize=True,
+        n_spixels=16,
+        n_iter=3,
+        tau=0.01,
+        candidate_radius=1,
+        normalize=True,
     )
     x = torch.randn(1, 3, 32, 16)
     with torch.no_grad():
         clst_feats, p2s_assign, s2p_assign = diff_slic(x)
     assert torch.isfinite(clst_feats).all(), "clst_feats has non-finite values"
     assert torch.isfinite(p2s_assign).all(), "p2s_assign has non-finite values"
-    assert s2p_assign is None or torch.isfinite(s2p_assign).all(), "s2p_assign has non-finite values"
-    assert clst_feats.shape[0] == 1 and clst_feats.shape[1] == 3, "clst_feats batch or channel dim wrong"
-    assert p2s_assign.shape[0] == 1 and p2s_assign.shape[1] == 9, "p2s_assign batch or candidate dim wrong"
-    assert p2s_assign.shape[-2:] == (32, 16), f"p2s_assign spatial dims wrong: {p2s_assign.shape[-2:]} vs (32, 16)"
+    assert s2p_assign is None or torch.isfinite(s2p_assign).all(), (
+        "s2p_assign has non-finite values"
+    )
+    assert clst_feats.shape[0] == 1 and clst_feats.shape[1] == 3, (
+        "clst_feats batch or channel dim wrong"
+    )
+    assert p2s_assign.shape[0] == 1 and p2s_assign.shape[1] == 9, (
+        "p2s_assign batch or candidate dim wrong"
+    )
+    assert p2s_assign.shape[-2:] == (32, 16), (
+        f"p2s_assign spatial dims wrong: {p2s_assign.shape[-2:]} vs (32, 16)"
+    )
 
 
 if __name__ == "__main__":

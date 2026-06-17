@@ -4,12 +4,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 from skimage import data, segmentation
 
-from VisualRWKV7.diffSLIC import DiffSLIC, spixel_upsampling
-from VisualRWKV7.model import (
-    build_knn_graph,
-    Vision_RWKV7,
-    q_shift_graph_multihead,
-)
+from VisualRWKV7 import DiffSLIC, spixel_upsampling, build_knn_graph, q_shift_graph_multihead, Vision_RWKV7
 
 
 def visualize_superpixels_and_graph(img_np, img_tensor, ax):
