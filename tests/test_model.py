@@ -1,3 +1,4 @@
+from typing import TypedDict, Optional, Sequence, NotRequired
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -9,9 +10,26 @@ from VisualRWKV7.model import (
     Vision_RWKV7_Block,
 )
 
+
 # =====================================================================
 # Helper Functions
 # =====================================================================
+
+
+class ModelConfig(TypedDict):
+    img_size: int
+    embed_dims: int
+    num_heads: int
+    depth: int
+    num_superpixels: int
+    diff_slic_iters: int
+    in_chans: NotRequired[int]
+    drop_path_rate: NotRequired[float]
+    init_values: NotRequired[Optional[float]]
+    final_norm: NotRequired[bool]
+    out_indices: NotRequired[Sequence[int]]
+    with_cls_token: NotRequired[bool]
+    output_cls_token: NotRequired[bool]
 
 
 def get_dummy_neighbors(B, N, K=4):
@@ -22,22 +40,22 @@ def get_dummy_neighbors(B, N, K=4):
 
 
 # Common small model configs to reduce duplication across tests
-_TINY_CONFIG = dict(
-    img_size=32,
-    embed_dims=64,
-    num_heads=1,
-    depth=1,
-    num_superpixels=9,
-    diff_slic_iters=2,
-)
-_SMALL_CONFIG = dict(
-    img_size=64,
-    embed_dims=64,
-    num_heads=1,
-    depth=2,
-    num_superpixels=16,
-    diff_slic_iters=2,
-)
+_TINY_CONFIG: ModelConfig = {
+    "img_size": 32,
+    "embed_dims": 64,
+    "num_heads": 1,
+    "depth": 1,
+    "num_superpixels": 9,
+    "diff_slic_iters": 2,
+}
+_SMALL_CONFIG: ModelConfig = {
+    "img_size": 64,
+    "embed_dims": 64,
+    "num_heads": 1,
+    "depth": 2,
+    "num_superpixels": 16,
+    "diff_slic_iters": 2,
+}
 
 
 # =====================================================================
@@ -240,7 +258,14 @@ def test_rwkv7_bonus_term():
 
 def test_vision_rwkv7_forward_hard():
     """Test full backbone forward pass with hard superpixel mode."""
-    model = Vision_RWKV7(**_SMALL_CONFIG)
+    model = Vision_RWKV7(
+        img_size=_SMALL_CONFIG["img_size"],
+        embed_dims=_SMALL_CONFIG["embed_dims"],
+        num_heads=_SMALL_CONFIG["num_heads"],
+        depth=_SMALL_CONFIG["depth"],
+        num_superpixels=_SMALL_CONFIG["num_superpixels"],
+        diff_slic_iters=_SMALL_CONFIG["diff_slic_iters"],
+    )
     x = torch.randn(1, 3, 64, 64)
     outs = model(x)
 
@@ -252,7 +277,14 @@ def test_vision_rwkv7_forward_hard():
 
 def test_vision_rwkv7_forward_soft():
     """Test full backbone forward pass if we manually change mode to soft."""
-    model = Vision_RWKV7(**_SMALL_CONFIG)
+    model = Vision_RWKV7(
+        img_size=_SMALL_CONFIG["img_size"],
+        embed_dims=_SMALL_CONFIG["embed_dims"],
+        num_heads=_SMALL_CONFIG["num_heads"],
+        depth=_SMALL_CONFIG["depth"],
+        num_superpixels=_SMALL_CONFIG["num_superpixels"],
+        diff_slic_iters=_SMALL_CONFIG["diff_slic_iters"],
+    )
     # Manually switch to soft mode to test that branch
     model.patch_embed.mode = "soft"
 
@@ -266,7 +298,14 @@ def test_vision_rwkv7_forward_soft():
 
 def test_output_matches_input_resolution():
     """Verify that the scattered output matches the original input resolution."""
-    model = Vision_RWKV7(**_TINY_CONFIG)
+    model = Vision_RWKV7(
+        img_size=_TINY_CONFIG["img_size"],
+        embed_dims=_TINY_CONFIG["embed_dims"],
+        num_heads=_TINY_CONFIG["num_heads"],
+        depth=_TINY_CONFIG["depth"],
+        num_superpixels=_TINY_CONFIG["num_superpixels"],
+        diff_slic_iters=_TINY_CONFIG["diff_slic_iters"],
+    )
     # Test with a different resolution than img_size
     x = torch.randn(1, 3, 128, 128)
     outs = model(x)
@@ -298,7 +337,16 @@ def test_multi_scale_indices():
 
 def test_cls_token_behavior():
     """Verify CLS token handling and output."""
-    model = Vision_RWKV7(**_TINY_CONFIG, with_cls_token=True, output_cls_token=True)
+    model = Vision_RWKV7(
+        img_size=_TINY_CONFIG["img_size"],
+        embed_dims=_TINY_CONFIG["embed_dims"],
+        num_heads=_TINY_CONFIG["num_heads"],
+        depth=_TINY_CONFIG["depth"],
+        num_superpixels=_TINY_CONFIG["num_superpixels"],
+        diff_slic_iters=_TINY_CONFIG["diff_slic_iters"],
+        with_cls_token=True,
+        output_cls_token=True,
+    )
     x = torch.randn(1, 3, 64, 64)
     outs = model(x)
 
@@ -311,7 +359,14 @@ def test_cls_token_behavior():
 
 def test_numerical_stability_long_seq():
     """Check for stability with larger grids (longer sequences)."""
-    model = Vision_RWKV7(**_TINY_CONFIG)
+    model = Vision_RWKV7(
+        img_size=_TINY_CONFIG["img_size"],
+        embed_dims=_TINY_CONFIG["embed_dims"],
+        num_heads=_TINY_CONFIG["num_heads"],
+        depth=_TINY_CONFIG["depth"],
+        num_superpixels=_TINY_CONFIG["num_superpixels"],
+        diff_slic_iters=_TINY_CONFIG["diff_slic_iters"],
+    )
     x = torch.randn(1, 3, 128, 128)
     outs = model(x)
     assert torch.isfinite(outs[0]).all()
@@ -363,7 +418,14 @@ def test_rwkv7_state_update_logic():
 
 def test_deterministic_behavior():
     """Verify that same input produces same output."""
-    model = Vision_RWKV7(**_SMALL_CONFIG)
+    model = Vision_RWKV7(
+        img_size=_SMALL_CONFIG["img_size"],
+        embed_dims=_SMALL_CONFIG["embed_dims"],
+        num_heads=_SMALL_CONFIG["num_heads"],
+        depth=_SMALL_CONFIG["depth"],
+        num_superpixels=_SMALL_CONFIG["num_superpixels"],
+        diff_slic_iters=_SMALL_CONFIG["diff_slic_iters"],
+    )
     x = torch.randn(1, 3, 64, 64)
 
     out1 = model(x)
@@ -384,7 +446,14 @@ def test_deterministic_behavior():
 
 def test_forward_finite_random_input():
     """Forward pass with random input produces all-finite outputs."""
-    model = Vision_RWKV7(**_SMALL_CONFIG)
+    model = Vision_RWKV7(
+        img_size=_SMALL_CONFIG["img_size"],
+        embed_dims=_SMALL_CONFIG["embed_dims"],
+        num_heads=_SMALL_CONFIG["num_heads"],
+        depth=_SMALL_CONFIG["depth"],
+        num_superpixels=_SMALL_CONFIG["num_superpixels"],
+        diff_slic_iters=_SMALL_CONFIG["diff_slic_iters"],
+    )
     x = torch.randn(2, 3, 64, 64)  # batch=2
     outs = model(x)
     assert all(torch.isfinite(o).all() for o in outs)
@@ -462,7 +531,14 @@ def test_non_square_input():
 def test_minimal_depth():
     """Model with depth=1 and small config produces finite output."""
     # HEAD_SIZE=64, so embed_dims must be >= HEAD_SIZE * n_head = 64
-    model = Vision_RWKV7(**_TINY_CONFIG)
+    model = Vision_RWKV7(
+        img_size=_TINY_CONFIG["img_size"],
+        embed_dims=_TINY_CONFIG["embed_dims"],
+        num_heads=_TINY_CONFIG["num_heads"],
+        depth=_TINY_CONFIG["depth"],
+        num_superpixels=_TINY_CONFIG["num_superpixels"],
+        diff_slic_iters=_TINY_CONFIG["diff_slic_iters"],
+    )
     x = torch.randn(1, 3, 32, 32)
     outs = model(x)
     assert len(outs) == 1

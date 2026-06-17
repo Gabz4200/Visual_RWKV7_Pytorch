@@ -434,7 +434,7 @@ if __name__ == "__main__":
     results = _run_diffslic_on_multiple_images()
 
     # Test 2: Different configurations
-    test_with_different_configs()
+    test_with_different_configs(196, 10, 0.01)
 
     # Final summary
     print("\n" + "=" * 80)
