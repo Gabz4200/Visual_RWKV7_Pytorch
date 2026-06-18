@@ -64,20 +64,22 @@ def q_shift_graph_multihead(
         f"neighbors length {neighbors.shape[1]} must match N={N}"
     )
 
-    x = input.view(B, N, n_head, head_dim)
-    output = torch.zeros_like(x)
-    clamped_neighbors = neighbors.clamp(min=0)
+    x = input.view(B, N, n_head, K, group_size)
+    clamped_neighbors = neighbors.clamp(min=0)  # [B, N, K]
 
-    for k in range(K):
-        neighbor_idx = clamped_neighbors[:, :, k]
-        x_group = x[:, :, :, k * group_size : (k + 1) * group_size]
-        idx = (
-            neighbor_idx.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, n_head, group_size)
-        )
-        gathered_group = torch.gather(x_group, 1, idx)
-        valid_k = (neighbors[:, :, k] != -1).view(B, N, 1, 1)
-        gathered_group = gathered_group * valid_k
-        output[:, :, :, k * group_size : (k + 1) * group_size] = gathered_group
+    # Reshape neighbors to match gather requirements: [B, N, n_head, K, group_size]
+    # We want to gather from the N dimension (dim=1)
+    gather_idx = (
+        clamped_neighbors.view(B, N, 1, K, 1)
+        .expand(B, N, n_head, K, group_size)
+    )
+
+    # Gather along the N dimension
+    output = torch.gather(x, 1, gather_idx)  # [B, N, n_head, K, group_size]
+
+    # Mask invalid neighbors (where neighbors == -1)
+    valid_mask = (neighbors != -1).view(B, N, 1, K, 1)
+    output = output * valid_mask
 
     output = output.view(B, N, C)
     if with_cls_token:

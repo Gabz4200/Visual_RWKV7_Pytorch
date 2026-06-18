@@ -1,6 +1,7 @@
 # Vision-RWKV-7: RWKV-7 vision backbone with Superpixel Tokenization (diffSLIC),
 # Graph-Based Q-Shift, bidirectional scanning, gated fusion, and multi-scale output.
 
+import warnings
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -11,6 +12,7 @@ from .diffSLIC import DiffSLIC
 from .utils.diffSLIC_funcs import spixel_upsampling
 from .utils.graph import build_knn_graph, q_shift_graph_multihead, HEAD_SIZE
 from .utils.drop import DropPath
+from .utils.data import prepare_balanced_superpixel_features
 
 TIME_MIX_EXTRA_DIM = 32
 
@@ -367,6 +369,9 @@ class Vision_RWKV7(nn.Module):
         compactness: float = 0.5,
     ):
         super().__init__()
+        if in_chans != 6:
+            warnings.warn(f"Vision_RWKV7 is optimized for 6-channel input (L, a, b, alpha, x, y). Forcing in_chans=6.")
+            in_chans = 6
         self.embed_dims = embed_dims
         self.num_layers = depth
         self.with_cls_token = with_cls_token
@@ -459,7 +464,6 @@ class Vision_RWKV7(nn.Module):
         else:
             # Legacy/Fallback: RGB or RGBA input
             # Automatically apply the balanced pipeline internally
-            from .utils.data import prepare_balanced_superpixel_features
             if C == 4:
                 srgb = x[:, :3, :, :]
                 alpha = x[:, 3:4, :, :]
@@ -471,28 +475,6 @@ class Vision_RWKV7(nn.Module):
         # Apply compactness scaling to the spatial channels for diffSLIC
         slic_input = model_input.clone()
         slic_input[:, 4:6, :, :] *= self.compactness
-
-        # Ensure patch_embed conv matches model_input channels
-        if model_input.shape[1] != self.patch_embed.conv.in_channels:
-            with torch.no_grad():
-                new_conv = nn.Conv2d(
-                    model_input.shape[1],
-                    self.patch_embed.conv.out_channels,
-                    kernel_size=self.patch_embed.conv.kernel_size,
-                    padding=self.patch_embed.conv.padding,
-                    device=model_input.device,
-                )
-                # Simple heuristic: copy available channels or repeat
-                old_weight = self.patch_embed.conv.weight
-                if model_input.shape[1] > old_weight.shape[1]:
-                    # Repeat channels if we have more input channels than weights
-                    repeats = (model_input.shape[1] + old_weight.shape[1] - 1) // old_weight.shape[1]
-                    new_weight = old_weight.repeat(1, repeats, 1, 1)[:, :model_input.shape[1], :, :]
-                else:
-                    new_weight = old_weight[:, :model_input.shape[1], :, :]
-                new_conv.weight.copy_(new_weight)
-                new_conv.bias.copy_(self.patch_embed.conv.bias)
-                self.patch_embed.conv = new_conv
 
         clst_feats, p2s_assign, _ = self.diff_slic(slic_input)
         h_s, w_s = clst_feats.shape[-2:]
