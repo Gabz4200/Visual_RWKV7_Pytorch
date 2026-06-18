@@ -4,29 +4,22 @@ import matplotlib.pyplot as plt
 import numpy as np
 from skimage import data, segmentation
 
-from VisualRWKV7 import DiffSLIC, spixel_upsampling, build_knn_graph, q_shift_graph_multihead, Vision_RWKV7
-from VisualRWKV7.utils.data import prepare_balanced_superpixel_features, preprocess_image_for_rwkv7
+from VisualRWKV7 import spixel_upsampling, build_knn_graph, q_shift_graph_multihead, create_vision_rwkv7
+from VisualRWKV7.utils.data import prepare_balanced_superpixel_features
 
 
-def visualize_superpixels_and_graph(img_np, img_tensor, ax):
+def visualize_superpixels_and_graph(img_np, img_tensor, model, ax):
     """Visualizes diffSLIC superpixels, centroids, and the K-NN graph."""
-    n_spixels = 150
-    compactness = 0.5
-    diff_slic = DiffSLIC(n_spixels=n_spixels, n_iter=10, tau=0.01, candidate_radius=1)
+    # Use the model's diff_slic and compactness for consistency
+    diff_slic = model.diff_slic
+    compactness = model.compactness
 
     with torch.no_grad():
-        B, C, H, W = img_tensor.shape
-        # Use the balanced pipeline
-        if C == 3:
-            model_input = prepare_balanced_superpixel_features(img_tensor)
-        else:
-            model_input = img_tensor
-
-        # Apply compactness scaling to the spatial channels for diffSLIC
-        slic_input = model_input.clone()
-        slic_input[:, 4:6, :, :] *= compactness
-
-        clst_feats, p2s_assign, _ = diff_slic(slic_input)
+        # Scale spatial channels by compactness before diffSLIC
+        img_tensor_for_slic = img_tensor.clone()
+        img_tensor_for_slic[:, -2:] *= compactness
+        
+        clst_feats, p2s_assign, _ = diff_slic(img_tensor_for_slic, n_spixels=model.num_superpixels)
 
     # Replicate the hard label upsampling from Vision_RWKV7.forward
     radius = diff_slic.candidate_radius
@@ -52,16 +45,18 @@ def visualize_superpixels_and_graph(img_np, img_tensor, ax):
         img_np, global_labels, color=(1, 0, 0), mode="thick"
     )
     ax.imshow(img_with_boundaries)
-    ax.set_title(f"Superpixels (K={n_spixels}) & Boundaries", fontsize=10)
+    ax.set_title(f"Superpixels (K={K}) & Boundaries", fontsize=10)
     ax.axis("off")
 
     # 2. Calculate and draw centroids + K-NN Graph
+    # Use the centroids from the model if available, or calculate from labels
+    # For visualization, we need pixel coordinates, so we use the labels.
     centroids = []
     for i in range(K):
         mask = global_labels == i
         if mask.sum() > 0:
-            y, x = np.where(mask)
-            centroids.append((x.mean(), y.mean()))
+            y_coords_px, x_coords_px = np.where(mask)
+            centroids.append((x_coords_px.mean(), y_coords_px.mean()))
         else:
             centroids.append((0, 0))  # Fallback
 
@@ -187,120 +182,66 @@ if __name__ == "__main__":
     img_np = data.astronaut()
 
     # Convert to PyTorch tensor: [1, 3, H, W], normalized to [0, 1]
-    img_tensor = torch.tensor(img_np).permute(2, 0, 1).unsqueeze(0).float() / 255.0
+    img_tensor_rgb = torch.tensor(img_np).permute(2, 0, 1).unsqueeze(0).float() / 255.0
+    
+    # Preprocess to 6-channel balanced features externally
+    img_tensor = prepare_balanced_superpixel_features(img_tensor_rgb)
 
     # Initialize a tiny model for feature extraction
     print("Initializing model...")
-    model = Vision_RWKV7(
+    model = create_vision_rwkv7(
         img_size=224, embed_dims=64, num_heads=1, depth=2, num_superpixels=150
     )
 
     # Create the visualization layout
-    fig = plt.figure(figsize=(16, 10))
-    gs = fig.add_gridspec(2, 3, height_ratios=[1, 1], width_ratios=[1, 1, 1])
+    fig = plt.figure(figsize=(16, 12))
+    gs = fig.add_gridspec(2, 2, height_ratios=[1, 1])
 
     ax1 = fig.add_subplot(gs[0, 0])
     ax2 = fig.add_subplot(gs[0, 1])
-    ax3 = fig.add_subplot(gs[0, 2])
-    ax4 = fig.add_subplot(gs[1, :])  # Spans the whole bottom row
+    
+    # Bottom row for Q-Shift mechanics (4 panels)
+    sub_gs_q = gs[1, :].subgridspec(1, 4)
+    ax_q = [fig.add_subplot(sub_gs_q[0, i]) for i in range(4)]
 
     print("Generating Superpixel & Graph Visualization...")
     # Resize to 224x224 to match model's expected input scale
     img_resized_tensor = F.interpolate(
         img_tensor, size=(224, 224), mode="bilinear", align_corners=False
     )
-    img_resized_np = img_resized_tensor.squeeze(0).permute(1, 2, 0).cpu().numpy()
+    # Use RGB image for visualization background
+    img_resized_rgb_tensor = F.interpolate(
+        img_tensor_rgb, size=(224, 224), mode="bilinear", align_corners=False
+    )
+    img_resized_rgb_np = img_resized_rgb_tensor.squeeze(0).permute(1, 2, 0).cpu().numpy()
 
-    visualize_superpixels_and_graph(img_resized_np, img_resized_tensor, ax1)
+    visualize_superpixels_and_graph(img_resized_rgb_np, img_resized_tensor, model, ax1)
 
     print("Generating Convolutional Feature Map Visualization...")
-    # --- Inline Conv Feature Viz ---
+    # We'll use ax2 for a summary of conv features
     with torch.no_grad():
-        balanced_features = prepare_balanced_superpixel_features(img_tensor)
-        features_input = F.interpolate(
-            balanced_features, size=(224, 224), mode="bilinear", align_corners=False
-        )
-        features = model.patch_embed.conv(features_input)
+        features = model.patch_embed.conv(img_resized_tensor)
         features = features.squeeze(0).cpu().numpy()
-    features_norm = (features - features.min(axis=(1, 2), keepdims=True)) / (
-        features.max(axis=(1, 2), keepdims=True)
-        - features.min(axis=(1, 2), keepdims=True)
-        + 1e-8
-    )
-
-    # Create a 2x2 sub-grid in the remaining space of the top row (columns 1 and 2)
-    sub_gs = gs[0, 1:3].subgridspec(2, 2)
-
-    # Hide the old unused axes borders
+    
+    features_norm = (features - features.min()) / (features.max() - features.min() + 1e-8)
+    ax2.imshow(features_norm[0], cmap="magma")
+    ax2.set_title("Conv Feature Map (Channel 0)", fontsize=10)
     ax2.axis("off")
-    ax3.axis("off")
-
-    for i in range(4):
-        # Math trick to get 0,0 0,1 1,0 1,1 coordinates for the 2x2 sub-grid
-        row = i // 2
-        col = i % 2
-
-        ax = fig.add_subplot(sub_gs[row, col])
-        ax.imshow(features_norm[i], cmap="magma")
-        ax.set_title(f"Conv Feature Ch {i}", fontsize=8)
-        ax.axis("off")
 
     print("Generating Q-Shift Mechanics Visualization...")
-    ax_q1 = fig.add_subplot(gs[1, 0])
-    ax_q2 = fig.add_subplot(gs[1, 1])
-    ax_q3 = fig.add_subplot(gs[1, 2])
-
-    # We'll just use the first 3 axes of the bottom row for a 3-panel Q-shift demo
-    # Panel 1: Original synthetic
-    # Panel 2: Shifted Right
-    # Panel 3: Shifted Down
-
-    H, W = 16, 16
-    x = np.linspace(0, 1, W)
-    y = np.linspace(0, 1, H)
-    X, Y = np.meshgrid(x, y)
-    synthetic_img = np.zeros((1, 4, H, W), dtype=np.float32)
-    synthetic_img[0, 0, :, :] = X  # Ch 0
-    synthetic_img[0, 2, :, :] = Y  # Ch 2
-
-    tensor_img = torch.tensor(synthetic_img)
-
-    # Generate grid centroids to build KNN graph for synthetic image
-    yy, xx = torch.meshgrid(torch.arange(H), torch.arange(W), indexing="ij")
-    centroids_synth = torch.stack((xx.flatten(), yy.flatten()), dim=-1).float()
-    neighbors_synth = build_knn_graph(centroids_synth, k=4)
-
-    shifted_img = (
-        q_shift_graph_multihead(
-            tensor_img.view(1, H * W, 4),
-            neighbors=neighbors_synth,
-            head_dim=4,
-        )
-        .view(1, H, W, 4)
-        .numpy()[0]
-    )
-
-    ax_q1.imshow(synthetic_img[0, 0], cmap="Blues", vmin=0, vmax=1)
-    ax_q1.set_title("Original (Ch 0: L→R Gradient)", fontsize=10)
-    ax_q1.axis("off")
-
-    ax_q2.imshow(shifted_img[:, :, 0], cmap="Blues", vmin=0, vmax=1)
-    ax_q2.set_title("Graph Q-Shifted (Neighbor 1)", fontsize=10)
-    ax_q2.axis("off")
-
-    ax_q3.imshow(shifted_img[:, :, 2], cmap="Reds", vmin=0, vmax=1)
-    ax_q3.set_title("Graph Q-Shifted (Neighbor 3)", fontsize=10)
-    ax_q3.axis("off")
+    visualize_q_shift_mechanics(ax_q)
 
     plt.suptitle(
         "Vision-RWKV-7 Internal Mechanics Visualization",
         fontsize=16,
         fontweight="bold",
-        y=0.995,
+        y=0.98,
     )
-    # Precise manual adjustment to avoid overlap
-    plt.subplots_adjust(
-        top=0.88, bottom=0.08, left=0.05, right=0.95, hspace=0.35, wspace=0.25
-    )
+    plt.tight_layout(rect=(0, 0.03, 1, 0.95))
+    
+    # Also show the full conv feature grid in a separate window
+    print("Showing full Conv feature grid...")
+    visualize_conv_features(img_tensor_rgb, model, None)
+    
     plt.show()
     print("Visualization complete!")

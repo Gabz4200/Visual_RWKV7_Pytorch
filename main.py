@@ -1,7 +1,7 @@
 """Vision-RWKV-7 demo: verify backbone with dummy image input."""
 
 import torch
-from VisualRWKV7.model import Vision_RWKV7
+from VisualRWKV7 import create_vision_rwkv7
 from VisualRWKV7.utils.data import preprocess_image_for_rwkv7
 
 # Inspired by: https://arxiv.org/abs/2109.08203
@@ -16,9 +16,8 @@ def main():
     torch.set_default_device(TORCH_DEVICE)
 
     # Initialize the new Vision-RWKV-7 with Superpixel Tokenization (diffSLIC)
-    model = Vision_RWKV7(
+    model = create_vision_rwkv7(
         img_size=64,
-        in_chans=6,
         embed_dims=192,
         num_heads=3,
         depth=12,
@@ -26,6 +25,7 @@ def main():
         final_norm=True,
         out_indices=[3, 5, 7, 11],
         num_superpixels=196,  # Target number of superpixels (approx 14x14 grid)
+        scatter_output=True,  # Scatter back to original resolution for this demo
         diff_slic_iters=5,  # Number of iterations for diffSLIC optimization
     )
 
@@ -48,11 +48,13 @@ def main():
             model._init_weights()
 
             # Dummy image input
-            x = preprocess_image_for_rwkv7(
+            x_raw = preprocess_image_for_rwkv7(
                 "test_image_from_slirack_pinterest.jpg",
                 target_size=(64, 64),
                 include_alpha=True,
             )
+            # x_raw is already (1, 6, 64, 64) from preprocess_image_for_rwkv7
+            x = x_raw.to(TORCH_DEVICE)
 
             # Forward pass
             outs = callable_model(x)

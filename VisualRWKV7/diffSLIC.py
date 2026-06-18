@@ -42,7 +42,7 @@ class DiffSLIC(nn.Module):
         self.stable = stable
 
     def forward(
-        self, x: torch.Tensor, clst_feats: Optional[torch.Tensor] = None
+        self, x: torch.Tensor, clst_feats: Optional[torch.Tensor] = None, n_spixels: Optional[int] = None
     ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
         r"""
         Args:
@@ -50,10 +50,11 @@ class DiffSLIC(nn.Module):
             clst_feats (Optional[torch.Tensor]): a tensor of shape (batch, channels, height_s, width_s)
                                                  initial cluster features. if clst_feats is None, it is
                                                  initialized by averaging pixels in a uniform grid
+            n_spixels (Optional[int]): if provided, overrides self.n_spixels for this forward pass.
 
         Returns:
             clst_feats (torch.Tensor): a tensor of shape (batch, channels, height_s, width_s)
-                                       height_s * width_s <= self.n_spixels
+                                       height_s * width_s <= (n_spixels or self.n_spixels)
             p2s_assign (torch.Tensor): a tensor of shape (batch, (2*candidate_radius + 1)**2, height, width)
                                        a pixel-to-superpixel assignemnt matrix
             s2p_assign (torch.Tensor): a tensor of shape
@@ -64,8 +65,9 @@ class DiffSLIC(nn.Module):
         height, width = x.shape[-2:]
         # initialize cluster features
         if clst_feats is None:
-            height_s = int(math.sqrt(self.n_spixels * height / width))
-            width_s = int(math.sqrt(self.n_spixels * width / height))
+            n_sp = n_spixels if n_spixels is not None else self.n_spixels
+            height_s = max(1, int(math.sqrt(n_sp * height / width)))
+            width_s = max(1, int(math.sqrt(n_sp * width / height)))
             stride_h = (height + height_s - 1) // height_s
             stride_w = (width + width_s - 1) // width_s
             stride = (stride_h, stride_w)

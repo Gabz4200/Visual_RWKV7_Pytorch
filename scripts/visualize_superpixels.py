@@ -8,7 +8,7 @@ import torch
 import matplotlib.pyplot as plt
 import numpy as np
 from PIL import Image
-from VisualRWKV7.model import Vision_RWKV7
+from VisualRWKV7 import create_vision_rwkv7
 from VisualRWKV7.utils.data import preprocess_image_for_rwkv7
 from skimage.segmentation import mark_boundaries
 
@@ -16,6 +16,7 @@ def main():
     parser = argparse.ArgumentParser(description="Visualize Visual-RWKV-7 Superpixel Tokenization")
     parser.add_argument("image_path", type=str, help="Path to the input image")
     parser.add_argument("--n_count", type=int, default=196, help="Target number of superpixels")
+    parser.add_argument("--spixel_size", type=int, default=None, help="Target superpixel size (scales K with resolution)")
     parser.add_argument("--compactness", type=float, default=0.5, help="Compactness factor (spatial vs color weight)")
     parser.add_argument("--iters", type=int, default=5, help="Number of diffSLIC iterations")
     parser.add_argument("--size", type=int, default=512, help="Image size for visualization")
@@ -29,17 +30,18 @@ def main():
     x = preprocess_image_for_rwkv7(
         args.image_path,
         target_size=(args.size, args.size),
+        spixel_size=args.spixel_size,
         include_alpha=True,
         chroma_scale=2.5 # Match the default used in preprocessing
     ).to(device)
 
     # 2. Initialize Model (Backbone)
-    model = Vision_RWKV7(
+    model = create_vision_rwkv7(
         img_size=args.size,
-        in_chans=6,
         embed_dims=64, # Small for visualization
         depth=1,       # Only need the first part for tokenization
         num_superpixels=args.n_count,
+        spixel_size=args.spixel_size,
         diff_slic_iters=args.iters,
         compactness=args.compactness
     ).to(device).eval()
@@ -51,14 +53,16 @@ def main():
     
     with torch.no_grad():
         # Replicate the logic from Vision_RWKV7.forward
-        B, _, _, _ = x.shape
-        model_input = x
+        B, _, H, W = x.shape
         
-        # Apply compactness scaling to the spatial channels for diffSLIC
-        slic_input = model_input.clone()
-        slic_input[:, 4:6, :, :] *= args.compactness
+        n_sp = args.n_count
+        if args.spixel_size is not None:
+            n_sp = int(round((H * W) / (args.spixel_size**2)))
+
+        # Scale spatial channels by compactness before diffSLIC
+        x_for_slic = torch.cat([x[:, :-2], x[:, -2:] * model.compactness], dim=1)
         
-        clst_feats, p2s_assign, _ = model.diff_slic(slic_input)
+        clst_feats, p2s_assign, _ = model.diff_slic(x_for_slic, n_spixels=n_sp)
         h_s, w_s = clst_feats.shape[-2:]
         K = h_s * w_s
         radius = model.diff_slic.candidate_radius

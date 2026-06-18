@@ -1,4 +1,5 @@
 import torch
+import math
 from PIL import Image
 import torchvision.transforms as transforms
 from torchvision import datasets
@@ -248,29 +249,65 @@ def add_spatial_coordinates(
     return torch.cat([tensor, grid_x, grid_y], dim=1)
 
 
+def smart_resize(
+    height: int,
+    width: int,
+    spixel_size: int = 16,
+    min_pixels: int = 4 * 16 * 16,
+    max_pixels: int = 1024 * 1024,
+) -> Tuple[int, int]:
+    """
+    Calculates a 'smart' resolution for an image, similar to Qwen2-VL.
+    Ensures height and width are multiples of spixel_size and total pixels
+    are within [min_pixels, max_pixels] while preserving aspect ratio.
+    """
+    if height < spixel_size or width < spixel_size:
+        # Scale up if too small
+        scale = max(spixel_size / height, spixel_size / width)
+        height, width = int(height * scale), int(width * scale)
+
+    # Clamp total pixels
+    pixels = height * width
+    if pixels < min_pixels:
+        scale = math.sqrt(min_pixels / pixels)
+        height, width = int(height * scale), int(width * scale)
+    elif pixels > max_pixels:
+        scale = math.sqrt(max_pixels / pixels)
+        height, width = int(height * scale), int(width * scale)
+
+    # Ensure multiples of spixel_size
+    new_h = max(spixel_size, round(height / spixel_size) * spixel_size)
+    new_w = max(spixel_size, round(width / spixel_size) * spixel_size)
+
+    return new_h, new_w
+
+
 def preprocess_image_for_rwkv7(
     image_path: str,
-    target_size: Optional[Tuple[int, int]] = (224, 224),
+    target_size: Optional[Tuple[int, int]] = None,
+    spixel_size: Optional[int] = 16,
     include_alpha: bool = True,
     chroma_scale: float = 2.5,
 ) -> torch.Tensor:
     """
-    Full pipeline: Load -> Convert to OkLAB -> Fixed Balancing -> Add Coordinates.
-    Returns a balanced tensor of shape (1, 6, H, W) with channels (L, a, b, alpha, x, y).
-    All channels are mapped to approximately [-1, 1] with zero mean.
+    Full pipeline: Load -> Smart Resize -> Convert to OkLAB -> Fixed Balancing -> Add Coordinates.
+    Returns a balanced tensor of shape (1, 6, H, W).
 
     Args:
         image_path (str): Path to the image file.
-        target_size (Tuple[int, int], optional): Target (Height, Width).
+        target_size (Tuple[int, int], optional): Explicit (Height, Width). 
+                                                 If None and spixel_size is set, uses smart_resize.
+        spixel_size (int, optional): Superpixel size for smart_resize.
         include_alpha (bool): If True, includes the alpha channel (RGBA).
         chroma_scale (float): Multiplier for 'a' and 'b' channels.
-
-    Returns:
-        torch.Tensor: Balanced tensor of shape (1, 6, H, W).
     """
+    img = Image.open(image_path)
+    w, h = img.size
+
+    if target_size is None and spixel_size is not None:
+        target_size = smart_resize(h, w, spixel_size=spixel_size)
+
     # 1. Load image as sRGB tensor [0, 1]
-    # We use load_image_to_tensor but without its internal normalization/conversion
-    # to get a clean sRGB + Alpha starting point.
     x_srgb = load_image_to_tensor(
         image_path,
         target_size=target_size,

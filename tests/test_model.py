@@ -3,12 +3,12 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from VisualRWKV7.model import (
-    build_knn_graph,
-    q_shift_graph_multihead,
     SuperpixelEmbedding,
     Vision_RWKV7,
     Vision_RWKV7_Block,
+    create_vision_rwkv7,
 )
+from VisualRWKV7.utils.graph import build_knn_graph, q_shift_graph_multihead
 
 
 # =====================================================================
@@ -22,6 +22,7 @@ class ModelConfig(TypedDict):
     num_heads: int
     depth: int
     num_superpixels: int
+    patch_size: NotRequired[Optional[int]]
     diff_slic_iters: int
     in_chans: NotRequired[int]
     drop_path_rate: NotRequired[float]
@@ -39,7 +40,7 @@ def get_dummy_neighbors(B, N, K=4):
     return neighbors.unsqueeze(0).expand(B, -1, -1)  # [B, N, K]
 
 
-# Common small model configs to reduce duplication across tests
+    # Common small model configs to reduce duplication across tests
 _TINY_CONFIG: ModelConfig = {
     "img_size": 32,
     "embed_dims": 64,
@@ -134,7 +135,7 @@ def test_q_shift_graph_multihead_cls_token():
 
 def test_superpixel_embedding_hard():
     """Test SuperpixelEmbedding in hard (discrete) mode."""
-    B, C_in, H, W = 2, 3, 8, 8
+    B, C_in, H, W = 2, 6, 8, 8
     K = 4
     embed_dims = 16
 
@@ -144,14 +145,15 @@ def test_superpixel_embedding_hard():
     # Create hard integer labels [B, H, W]
     sp_map = torch.randint(0, K, (B, H, W))
 
-    tokens = emb(x, sp_map)
+    tokens, centroids = emb(x, sp_map)
     assert tokens.shape == (B, K, embed_dims)
+    assert centroids.shape == (B, K, 2)
     assert torch.isfinite(tokens).all()
 
 
 def test_superpixel_embedding_soft():
     """Test SuperpixelEmbedding in soft (continuous) mode."""
-    B, C_in, H, W = 2, 3, 8, 8
+    B, C_in, H, W = 2, 6, 8, 8
     K = 4
     embed_dims = 16
 
@@ -162,8 +164,9 @@ def test_superpixel_embedding_soft():
     sp_map = torch.rand(B, K, H, W)
     sp_map = sp_map / sp_map.sum(dim=1, keepdim=True)  # normalize
 
-    tokens = emb(x, sp_map)
+    tokens, centroids = emb(x, sp_map)
     assert tokens.shape == (B, K, embed_dims)
+    assert centroids.shape == (B, K, 2)
     assert torch.isfinite(tokens).all()
 
 
@@ -269,12 +272,12 @@ def test_vision_rwkv7_forward_hard():
         diff_slic_iters=_SMALL_CONFIG["diff_slic_iters"],
         in_chans=_SMALL_CONFIG["in_chans"],
     )
-    x = torch.randn(1, 6, 64, 64)
+    x = torch.randn(1, _SMALL_CONFIG["in_chans"], 64, 64)
     outs = model(x)
 
     # Output should be scattered back to original [B, C, H, W]
     assert len(outs) == 1  # default out_indices=(-1,)
-    assert outs[0].shape == (1, 64, 64, 64)
+    assert outs[0].shape == (1, 64, 4, 4)
     assert torch.isfinite(outs[0]).all()
 
 
@@ -292,11 +295,11 @@ def test_vision_rwkv7_forward_soft():
     # Manually switch to soft mode to test that branch
     model.patch_embed.mode = "soft"
 
-    x = torch.randn(1, 6, 64, 64)
+    x = torch.randn(1, _SMALL_CONFIG["in_chans"], 64, 64)
     outs = model(x)
 
     assert len(outs) == 1
-    assert outs[0].shape == (1, 64, 64, 64)
+    assert outs[0].shape == (1, 64, 4, 4)
     assert torch.isfinite(outs[0]).all()
 
 
@@ -310,9 +313,10 @@ def test_output_matches_input_resolution():
         num_superpixels=_TINY_CONFIG["num_superpixels"],
         diff_slic_iters=_TINY_CONFIG["diff_slic_iters"],
         in_chans=_TINY_CONFIG["in_chans"],
+        scatter_output=True,
     )
     # Test with a different resolution than img_size
-    x = torch.randn(1, 6, 128, 128)
+    x = torch.randn(1, _TINY_CONFIG["in_chans"], 128, 128)
     outs = model(x)
 
     # Output must be scattered back to [B, C, 128, 128]
@@ -336,9 +340,9 @@ def test_multi_scale_indices():
     outs = model(x)
 
     assert len(outs) == 2
-    # Both outputs are scattered back to [B, C, H, W]
-    assert outs[0].shape == (1, 64, 64, 64)
-    assert outs[1].shape == (1, 64, 64, 64)
+    # Both outputs are at grid resolution
+    assert outs[0].shape == (1, 64, 3, 3)
+    assert outs[1].shape == (1, 64, 3, 3)
 
 
 def test_cls_token_behavior():
@@ -353,8 +357,9 @@ def test_cls_token_behavior():
         with_cls_token=True,
         output_cls_token=True,
         in_chans=_TINY_CONFIG["in_chans"],
+        scatter_output=True,
     )
-    x = torch.randn(1, 6, 64, 64)
+    x = torch.randn(1, _TINY_CONFIG["in_chans"], 64, 64)
     outs = model(x)
 
     assert isinstance(outs[0], tuple)
@@ -375,7 +380,7 @@ def test_numerical_stability_long_seq():
         diff_slic_iters=_TINY_CONFIG["diff_slic_iters"],
         in_chans=_TINY_CONFIG["in_chans"],
     )
-    x = torch.randn(1, 6, 128, 128)
+    x = torch.randn(1, _TINY_CONFIG["in_chans"], 128, 128)
     outs = model(x)
     assert torch.isfinite(outs[0]).all()
 
@@ -435,7 +440,7 @@ def test_deterministic_behavior():
         diff_slic_iters=_SMALL_CONFIG["diff_slic_iters"],
         in_chans=_SMALL_CONFIG["in_chans"],
     )
-    x = torch.randn(1, 6, 64, 64)
+    x = torch.randn(1, _SMALL_CONFIG["in_chans"], 64, 64)
 
     out1 = model(x)
     out2 = model(x)
@@ -464,7 +469,7 @@ def test_forward_finite_random_input():
         diff_slic_iters=_SMALL_CONFIG["diff_slic_iters"],
         in_chans=_SMALL_CONFIG["in_chans"],
     )
-    x = torch.randn(2, 6, 64, 64)  # batch=2
+    x = torch.randn(2, _SMALL_CONFIG["in_chans"], 64, 64)  # batch=2
     outs = model(x)
     assert all(torch.isfinite(o).all() for o in outs)
     assert len(outs) == 1  # default out_indices
@@ -479,6 +484,7 @@ def test_scatter_output_spatial_shape():
         depth=2,
         num_superpixels=16,
         in_chans=6,
+        scatter_output=True,
     )
     x = torch.randn(1, 6, 128, 128)  # different from img_size
     outs = model(x)
@@ -500,9 +506,9 @@ def test_multi_scale_output_count():
     x = torch.randn(1, 6, 64, 64)
     outs = model(x)
     assert len(outs) == 3
-    assert outs[0].shape == (1, 64, 64, 64)
-    assert outs[1].shape == (1, 64, 64, 64)
-    assert outs[2].shape == (1, 64, 64, 64)
+    assert outs[0].shape == (1, 64, 4, 4)
+    assert outs[1].shape == (1, 64, 4, 4)
+    assert outs[2].shape == (1, 64, 4, 4)
 
 
 def test_cls_token_output_shape():
@@ -516,6 +522,7 @@ def test_cls_token_output_shape():
         with_cls_token=True,
         output_cls_token=True,
         in_chans=6,
+        scatter_output=True,
     )
     x = torch.randn(1, 6, 64, 64)
     outs = model(x)
@@ -535,6 +542,7 @@ def test_non_square_input():
         depth=2,
         num_superpixels=8,
         in_chans=6,
+        scatter_output=True,
     )
     x = torch.randn(1, 6, 48, 96)  # non-square
     outs = model(x)
@@ -554,7 +562,7 @@ def test_minimal_depth():
         diff_slic_iters=_TINY_CONFIG["diff_slic_iters"],
         in_chans=_TINY_CONFIG["in_chans"],
     )
-    x = torch.randn(1, 6, 32, 32)
+    x = torch.randn(1, _TINY_CONFIG["in_chans"], 32, 32)
     outs = model(x)
     assert len(outs) == 1
     assert torch.isfinite(outs[0]).all()
@@ -580,6 +588,7 @@ def test_gradient_flow_end_to_end():
     assert torch.isfinite(x.grad).all()
 
 
+
 def test_deterministic_across_calls():
     """Same input produces same output across multiple forward calls."""
     model = Vision_RWKV7(
@@ -595,3 +604,65 @@ def test_deterministic_across_calls():
     out2 = model(x)
     for o1, o2 in zip(out1, out2):
         assert torch.allclose(o1, o2, atol=1e-5)
+
+
+def test_dynamic_resolution_spixel_size():
+    """Verify that spixel_size correctly scales the number of superpixels."""
+    # spixel_size=16 means K = (H*W) / (16*16)
+    model = create_vision_rwkv7(
+        img_size=64,
+        embed_dims=64,
+        num_heads=1,
+        depth=1,
+        spixel_size=16,
+    )
+    
+    # 1. 64x64 input -> (64*64)/(16*16) = 16 superpixels (4x4 grid)
+    x1 = torch.randn(1, 6, 64, 64)
+    outs1 = model(x1)
+    # Default is scatter_output=False, so output is at grid resolution
+    assert outs1[0].shape == (1, 64, 4, 4)
+    
+    # 2. 128x128 input -> (128*128)/(16*16) = 64 superpixels (8x8 grid)
+    x2 = torch.randn(1, 6, 128, 128)
+    outs2 = model(x2)
+    assert outs2[0].shape == (1, 64, 8, 8)
+    
+    # 3. Non-square 64x128 -> (64*128)/(16*16) = 32 superpixels (4x8 grid)
+    x3 = torch.randn(1, 6, 64, 128)
+    outs3 = model(x3)
+    assert outs3[0].shape == (1, 64, 4, 8)
+
+
+def test_vision_rwkv7_scatter_output():
+    """Verify that scatter_output=True restores original resolution."""
+    model = create_vision_rwkv7(
+        img_size=64,
+        embed_dims=64,
+        num_heads=1,
+        depth=1,
+        num_superpixels=16,
+        scatter_output=True,
+    )
+    x = torch.randn(1, 6, 64, 64)
+    outs = model(x)
+    assert outs[0].shape == (1, 64, 64, 64)
+
+
+def test_forward_num_superpixels_override():
+    """Verify that num_superpixels can be overridden in the forward pass."""
+    model = create_vision_rwkv7(
+        img_size=64,
+        embed_dims=64,
+        num_heads=1,
+        depth=1,
+        num_superpixels=16,
+    )
+    
+    # Override to 36 superpixels (6x6)
+    x = torch.randn(1, 6, 64, 64)
+    outs = model(x, num_superpixels=36)
+    assert outs[0].shape == (1, 64, 6, 6)
+    # We can't easily check the internal K without hooks, but if it doesn't crash 
+    # and produces the right output shape, the interpolation and graph building 
+    # worked for the new K.

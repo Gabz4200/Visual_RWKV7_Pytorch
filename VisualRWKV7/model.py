@@ -1,10 +1,10 @@
 # Vision-RWKV-7: RWKV-7 vision backbone with Superpixel Tokenization (diffSLIC),
 # Graph-Based Q-Shift, bidirectional scanning, gated fusion, and multi-scale output.
 
-import warnings
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import math
 from typing import Optional, Sequence, Tuple
 
 # Import diffSLIC components from the same directory
@@ -12,7 +12,6 @@ from .diffSLIC import DiffSLIC
 from .utils.diffSLIC_funcs import spixel_upsampling
 from .utils.graph import build_knn_graph, q_shift_graph_multihead, HEAD_SIZE
 from .utils.drop import DropPath
-from .utils.data import prepare_balanced_superpixel_features
 
 TIME_MIX_EXTRA_DIM = 32
 
@@ -311,36 +310,78 @@ class Vision_RWKV7_Block(nn.Module):
 
 
 class SuperpixelEmbedding(nn.Module):
-    """Convert 2D image to superpixel tokens via mask-based aggregation."""
-
-    def __init__(
-        self, in_chans: int, embed_dims: int, num_superpixels: int, mode: str = "soft"
-    ):
+    """
+    Converts 2D image to superpixel tokens.
+    Preserves raw input channels, adds conv features, and explicitly injects 
+    normalized centroids and areas to maintain spatial/size priors.
+    """
+    def __init__(self, in_chans: int, embed_dims: int, num_superpixels: int, mode: str = "soft"):
         super().__init__()
-        assert mode in ("hard", "soft"), "mode must be 'hard' or 'soft'"
+        self.in_chans = in_chans
+        self.embed_dims = embed_dims
         self.num_superpixels = num_superpixels
         self.mode = mode
-        self.conv = nn.Conv2d(in_chans, embed_dims, kernel_size=3, padding=1)
+        
+        # Calculate dynamic conv channels: embed_dims - in_chans - 3 (for x, y, area)
+        self.conv_chans = embed_dims - in_chans - 3
+        if self.conv_chans <= 0:
+            raise ValueError(
+                f"embed_dims ({embed_dims}) must be strictly greater than "
+                f"in_chans + 3 ({in_chans + 3})."
+            )
+            
+        self.conv = nn.Conv2d(in_chans, self.conv_chans, kernel_size=3, padding=1)
         self.proj = nn.Linear(embed_dims, embed_dims)
         self.norm = nn.LayerNorm(embed_dims)
 
-    def forward(self, x: torch.Tensor, sp_map: torch.Tensor) -> torch.Tensor:
-        # 1. Feature Extraction (Convolution)
-        x = self.conv(x)
-        # New shape: [B, embed_dims, H, W]
-
-        # 2. Aggregation (Adaptive Average Pool over superpixel area)
+    def forward(self, x: torch.Tensor, sp_map: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        B, C_in, H, W = x.shape
+        assert C_in == self.in_chans, f"Expected {self.in_chans} channels, got {C_in}"
+        
+        # 1. Prepare mask and pooling weights
         if self.mode == "hard":
-            K = max(int(sp_map.max().item() + 1), self.num_superpixels)
+            # Determine K dynamically from the label map
+            K = int(sp_map.max().item()) + 1
             mask = F.one_hot(sp_map.long(), num_classes=K).permute(0, 3, 1, 2).float()
         else:
             mask = sp_map
-
+            K = mask.shape[1]
+            
+        # Normalize mask over spatial dimensions to get soft/hard weights
         weights = mask / (mask.sum(dim=(2, 3), keepdim=True) + 1e-6)
-        sp_features = torch.einsum("bkhw,bdhw->bkd", weights, x)
-
-        # 3. Final Projection
-        return self.norm(self.proj(sp_features))
+        
+        # 2. Pool raw features directly (preserves in_chans)
+        pooled_raw = torch.einsum("bkhw,bchw->bkc", weights, x)
+        
+        # 3. Conv and pool (adds conv_chans)
+        x_conv = self.conv(x)
+        pooled_conv = torch.einsum("bkhw,bchw->bkc", weights, x_conv)
+        
+        # 4. Compute Centroids and Areas dynamically from the mask
+        # Area: ratio of pixels in superpixel to total pixels
+        areas = mask.sum(dim=(2, 3)) / (H * W)
+        areas_norm = 2.0 * areas - 1.0  # Map [0, 1] to [-1, 1]
+        
+        # Centroids: weighted average of spatial coordinates using linspace [-1, 1]
+        grid_y = torch.linspace(-1.0, 1.0, H, device=x.device, dtype=x.dtype)
+        grid_x = torch.linspace(-1.0, 1.0, W, device=x.device, dtype=x.dtype)
+        gy, gx = torch.meshgrid(grid_y, grid_x, indexing='ij')
+        coords = torch.stack([gx, gy], dim=-1)  # (H, W, 2) -> x is dim 0, y is dim 1
+        
+        centroids = torch.einsum("bkhw,hwc->bkc", weights, coords)  # (B, K, 2)
+        
+        # 5. Concatenate: centroid_x, centroid_y, area, superpixel_features
+        # centroids: (B, K, 2), areas_norm: (B, K)
+        # pooled_raw: (B, K, in_chans), pooled_conv: (B, K, conv_chans)
+        
+        final_tokens = torch.cat([
+            centroids, 
+            areas_norm.unsqueeze(-1), 
+            pooled_raw, 
+            pooled_conv
+        ], dim=-1) # (B, K, embed_dims)
+        
+        return self.norm(self.proj(final_tokens)), centroids
 
 
 # =====================================================================
@@ -354,9 +395,9 @@ class Vision_RWKV7(nn.Module):
     def __init__(
         self,
         img_size: int = 224,
-        in_chans: int = 6,
+        in_chans: int = 3,
         embed_dims: int = 192,
-        num_heads: int = 3,
+        num_heads: Optional[int] = None,
         depth: int = 12,
         drop_path_rate: float = 0.0,
         init_values: Optional[float] = 1e-5,
@@ -364,19 +405,28 @@ class Vision_RWKV7(nn.Module):
         out_indices: Sequence[int] = (-1,),
         with_cls_token: bool = False,
         output_cls_token: bool = False,
+        scatter_output: bool = False,
         num_superpixels: int = 196,
+        spixel_size: Optional[int] = None,
         diff_slic_iters: int = 5,
         compactness: float = 0.5,
     ):
         super().__init__()
-        if in_chans != 6:
-            warnings.warn(f"Vision_RWKV7 is optimized for 6-channel input (L, a, b, alpha, x, y). Forcing in_chans=6.")
-            in_chans = 6
+        self.img_size = img_size
         self.embed_dims = embed_dims
         self.num_layers = depth
         self.with_cls_token = with_cls_token
         self.output_cls_token = output_cls_token
+        self.scatter_output = scatter_output
         self.compactness = compactness
+        self.in_chans = in_chans
+        self.num_superpixels = num_superpixels
+        self.spixel_size = spixel_size
+
+        # Dynamic calculation of num_heads if not provided
+        if num_heads is None:
+            assert embed_dims % HEAD_SIZE == 0, f"embed_dims={embed_dims} must be divisible by HEAD_SIZE={HEAD_SIZE} if num_heads is not provided"
+            num_heads = embed_dims // HEAD_SIZE
 
         # 1. Differentiable SLIC for dynamic superpixel generation
         self.diff_slic = DiffSLIC(
@@ -389,13 +439,13 @@ class Vision_RWKV7(nn.Module):
 
         # 2. Superpixel Embedding (Mask-based aggregation)
         self.patch_embed = SuperpixelEmbedding(
-            in_chans, embed_dims, num_superpixels, mode="hard"
+            in_chans, embed_dims, num_superpixels, mode="soft"
         )
-        self.in_chans = in_chans
 
-        # 3. 1D Positional Embedding (Size is K, we add a buffer just in case K varies slightly by aspect ratio)
-        self.max_K = num_superpixels + 16
-        self.pos_embed = nn.Parameter(torch.zeros(1, self.max_K, embed_dims))
+        # 3. 2D Positional Embedding (Interpolatable)
+        # We use a 14x14 grid as base (196 tokens), which can be interpolated to any (h_s, w_s).
+        self.pos_grid_size = int(math.sqrt(num_superpixels))
+        self.pos_embed = nn.Parameter(torch.zeros(1, embed_dims, self.pos_grid_size, self.pos_grid_size))
 
         if with_cls_token:
             self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dims))
@@ -438,108 +488,78 @@ class Vision_RWKV7(nn.Module):
                 self.cls_token.zero_()
             nn.init.trunc_normal_(self.pos_embed, std=0.02)
 
-    @staticmethod
-    def _compute_centroids(mask: torch.Tensor) -> torch.Tensor:
-        """Compute spatial centroids from a superpixel mask [B, K, H, W] -> [B, K, 2] (x, y)."""
-        B, K, H, W = mask.shape
-        grid_y, grid_x = torch.meshgrid(
-            torch.arange(H, device=mask.device),
-            torch.arange(W, device=mask.device),
-            indexing="ij",
-        )
-        coords = torch.stack([grid_x, grid_y], dim=-1).float()
-        counts = mask.sum(dim=(2, 3), keepdim=True).clamp(min=1)
-        return torch.einsum("bkhw,hwc->bkc", mask, coords) / counts.squeeze(-1)
-
-    def forward(self, x: torch.Tensor):
+    def forward(self, x: torch.Tensor, num_superpixels: Optional[int] = None):
         B, C, H, W = x.shape
+        
+        # STRICT ASSERTION: The model is agnostic, but it demands consistency.
+        assert C == self.in_chans, (
+            f"Model initialized with in_chans={self.in_chans}, but received input with C={C}. "
+            "Please handle data preparation externally."
+        )
 
         # ---------------------------------------------------------
         # 1. Generate Superpixels via diffSLIC
         # ---------------------------------------------------------
-        if C == 6:
-            # Full pipeline input: (L, a, b, alpha, x, y)
-            # We use it directly for diffSLIC.
-            model_input = x
-        else:
-            # Legacy/Fallback: RGB or RGBA input
-            # Automatically apply the balanced pipeline internally
-            if C == 4:
-                srgb = x[:, :3, :, :]
-                alpha = x[:, 3:4, :, :]
+        # Dynamic n_spixels: priority: forward arg > spixel_size calculation > init value
+        n_sp = num_superpixels
+        if n_sp is None:
+            if self.spixel_size is not None:
+                # Scale K with image area: K = (H * W) / (spixel_size^2)
+                n_sp = int(round((H * W) / (self.spixel_size**2)))
             else:
-                srgb = x
-                alpha = None
-            model_input = prepare_balanced_superpixel_features(srgb, alpha=alpha)
+                n_sp = self.num_superpixels
 
-        # Apply compactness scaling to the spatial channels for diffSLIC
-        slic_input = model_input.clone()
-        slic_input[:, 4:6, :, :] *= self.compactness
-
-        clst_feats, p2s_assign, _ = self.diff_slic(slic_input)
+        # Scale spatial channels by compactness before diffSLIC to control grid regularity.
+        # x has shape (B, 6, H, W) where channels are [L, a, b, alpha, x, y].
+        # We only scale the last two channels (x, y) without cloning the whole tensor.
+        x_for_slic = torch.cat([x[:, :-2], x[:, -2:] * self.compactness], dim=1)
+        
+        clst_feats, p2s_assign, _ = self.diff_slic(x_for_slic, n_spixels=n_sp)
         h_s, w_s = clst_feats.shape[-2:]
         K = h_s * w_s
         radius = self.diff_slic.candidate_radius
 
         # ---------------------------------------------------------
-        # 2. Tokenize & Embed (Mode-dependent logic)
+        # 2. Tokenize & Embed
         # ---------------------------------------------------------
         global_soft_mask: Optional[torch.Tensor] = None
         global_labels: Optional[torch.Tensor] = None
 
         if self.patch_embed.mode == "hard":
-            # HARD MODE: Use argmax to get discrete integer labels [B, H, W]
             neighbor_range = 2 * radius + 1
             hard_assign = (
                 F.one_hot(p2s_assign.argmax(1), neighbor_range**2)
-                .permute(0, 3, 1, 2)
-                .contiguous()
-                .float()
+                .permute(0, 3, 1, 2).contiguous().float()
             )
             label_grid = (
                 torch.arange(K, dtype=torch.float, device=x.device)
-                .reshape(1, 1, h_s, w_s)
-                .expand(B, -1, -1, -1)
+                .reshape(1, 1, h_s, w_s).expand(B, -1, -1, -1)
             )
-
             global_labels = (
                 spixel_upsampling(label_grid, hard_assign, candidate_radius=radius)
-                .squeeze(1)
-                .long()
+                .squeeze(1).long()
             )
-            tokens = self.patch_embed(model_input, global_labels)
-
+            # patch_embed now returns BOTH tokens and centroids
+            tokens, centroids = self.patch_embed(x, global_labels)
         else:
-            # SOFT MODE: Bypass argmax! Create one-hot superpixel IDs [1, K, H_s, W_s]
             spixel_ids = (
                 torch.arange(K, device=x.device)
-                .reshape(1, K, 1, 1)
-                .expand(B, -1, h_s, w_s)
-                .float()
+                .reshape(1, K, 1, 1).expand(B, -1, h_s, w_s).float()
             )
-
-            # Upsample using the raw local soft assignments (p2s_assign) directly.
-            # Because spixel_ids is one-hot, spixel_upsampling will output a global
-            # soft mask [B, K, H, W] where mask[b, k, h, w] is the probability
-            # that pixel (h, w) belongs to superpixel k.
             global_soft_mask = spixel_upsampling(
                 spixel_ids, p2s_assign, candidate_radius=radius
             )
-            tokens = self.patch_embed(model_input, global_soft_mask)
+            tokens, centroids = self.patch_embed(x, global_soft_mask)
 
-        # Add 1D positional embedding
-        tokens = tokens + self.pos_embed[:, :K, :]
+        # Add 2D positional embedding (interpolated to current superpixel grid)
+        # pos_embed is (1, D, gh, gw), we interpolate to (1, D, h_s, w_s)
+        pos_embed = F.interpolate(
+            self.pos_embed, size=(h_s, w_s), mode="bicubic", align_corners=False
+        )
+        pos_embed = pos_embed.flatten(2).transpose(1, 2)  # (1, K, D)
+        tokens = tokens + pos_embed
 
-        # Compute Centroids to build KNN Graph
-        if self.patch_embed.mode == "soft":
-            assert global_soft_mask is not None
-            mask = global_soft_mask
-        else:
-            assert global_labels is not None
-            mask = F.one_hot(global_labels, num_classes=K).permute(0, 3, 1, 2).float()
-        centroids = self._compute_centroids(mask)
-
-        # Build Graph
+        # Build Graph using the centroids returned directly by SuperpixelEmbedding
         neighbors = build_knn_graph(centroids.detach(), k=4)
 
         if self.with_cls_token:
@@ -562,23 +582,25 @@ class Vision_RWKV7(nn.Module):
                 patch_tokens = tokens[:, :-1] if self.with_cls_token else tokens
                 cls_out = tokens[:, -1] if self.with_cls_token else None
 
-                # SCATTER BACK TO GRID
-                if self.patch_embed.mode == "soft":
-                    # For soft mode, we scatter using the soft mask (weighted sum of tokens)
-                    # patch_tokens is [B, K, D], global_soft_mask is [B, K, H, W]
-                    assert global_soft_mask is not None
-                    feat = torch.einsum(
-                        "bkd,bkhw->bhwd", patch_tokens, global_soft_mask
-                    )
-                    feat = feat.permute(0, 3, 1, 2)  # [B, D, H, W]
+                if self.scatter_output:
+                    # SCATTER BACK TO GRID (Original Resolution H, W)
+                    if self.patch_embed.mode == "soft":
+                        assert global_soft_mask is not None
+                        feat = torch.einsum(
+                            "bkd,bkhw->bhwd", patch_tokens, global_soft_mask
+                        )
+                        feat = feat.permute(0, 3, 1, 2)  # [B, D, H, W]
+                    else:
+                        assert global_labels is not None
+                        feat = patch_tokens.gather(
+                            1,
+                            global_labels.view(B, H * W, 1).expand(-1, -1, self.embed_dims),
+                        )
+                        feat = feat.view(B, H, W, self.embed_dims).permute(0, 3, 1, 2)
                 else:
-                    # For hard mode, we gather using the hard labels
-                    assert global_labels is not None
-                    feat = patch_tokens.gather(
-                        1,
-                        global_labels.view(B, H * W, 1).expand(-1, -1, self.embed_dims),
-                    )
-                    feat = feat.view(B, H, W, self.embed_dims).permute(0, 3, 1, 2)
+                    # RETURN AT SUPERPIXEL GRID RESOLUTION (h_s, w_s)
+                    # This is the standard behavior for resolution-agnostic backbones.
+                    feat = patch_tokens.view(B, h_s, w_s, self.embed_dims).permute(0, 3, 1, 2)
 
                 if self.output_cls_token and cls_out is not None:
                     outs.append((feat, cls_out))
@@ -586,3 +608,49 @@ class Vision_RWKV7(nn.Module):
                     outs.append(feat)
 
         return tuple(outs)
+
+
+# =====================================================================
+# Model Builders
+# =====================================================================
+
+
+def create_vision_rwkv7(
+    img_size: int = 224,
+    embed_dims: int = 192,
+    num_heads: Optional[int] = None,
+    depth: int = 12,
+    drop_path_rate: float = 0.0,
+    init_values: Optional[float] = 1e-5,
+    final_norm: bool = True,
+    out_indices: Sequence[int] = (-1,),
+    with_cls_token: bool = False,
+    output_cls_token: bool = False,
+    scatter_output: bool = False,
+    num_superpixels: int = 196,
+    spixel_size: Optional[int] = None,
+    diff_slic_iters: int = 5,
+    compactness: float = 0.5,
+) -> Vision_RWKV7:
+    """
+    Creates a Vision_RWKV7 model enforced to 6-channel input (L, a, b, alpha, x, y).
+    This is the standard entry point for this repository.
+    """
+    return Vision_RWKV7(
+        img_size=img_size,
+        in_chans=6,  # Enforced externally to the class
+        embed_dims=embed_dims,
+        num_heads=num_heads,
+        depth=depth,
+        drop_path_rate=drop_path_rate,
+        init_values=init_values,
+        final_norm=final_norm,
+        out_indices=out_indices,
+        with_cls_token=with_cls_token,
+        output_cls_token=output_cls_token,
+        scatter_output=scatter_output,
+        num_superpixels=num_superpixels,
+        spixel_size=spixel_size,
+        diff_slic_iters=diff_slic_iters,
+        compactness=compactness,
+    )
