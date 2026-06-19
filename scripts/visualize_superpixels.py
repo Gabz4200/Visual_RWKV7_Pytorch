@@ -35,15 +35,19 @@ def main():
     ).to(device)
 
     # 2. Initialize Model (Backbone)
-    model = create_vision_rwkv7(
-        img_size=args.size,
-        embed_dims=64,
-        depth=1,
-        num_superpixels=args.n_count,
-        spixel_size=args.spixel_size,
-        diff_slic_iters=args.iters,
-        compactness=args.compactness,
-    ).to(device).eval()
+    model = (
+        create_vision_rwkv7(
+            img_size=args.size,
+            embed_dims=64,
+            depth=1,
+            num_superpixels=args.n_count,
+            spixel_size=args.spixel_size,
+            diff_slic_iters=args.iters,
+            compactness=args.compactness,
+        )
+        .to(device)
+        .eval()
+    )
 
     # 3. Run Forward pass to get superpixel labels
     with torch.no_grad():
@@ -62,9 +66,11 @@ def main():
 
         hard_assign_idx = p2s_assign.argmax(1)
         neighbor_range = 2 * radius + 1
-        hard_assign_mask = torch.nn.functional.one_hot(
-            hard_assign_idx, neighbor_range**2
-        ).permute(0, 3, 1, 2).float()
+        hard_assign_mask = (
+            torch.nn.functional.one_hot(hard_assign_idx, neighbor_range**2)
+            .permute(0, 3, 1, 2)
+            .float()
+        )
 
         label_grid = (
             torch.arange(K, dtype=torch.float, device=x.device)
@@ -89,9 +95,7 @@ def main():
     out = mark_boundaries(display_np, labels_np, color=(1, 1, 0))
 
     ax.imshow(out)
-    ax.set_title(
-        f"SpixRWKV-7 Superpixels (n_count={args.n_count}, compactness={args.compactness})"
-    )
+    ax.set_title(f"SpixRWKV-7 Superpixels (n_count={args.n_count}, compactness={args.compactness})")
     ax.axis("off")
 
     plt.tight_layout()
