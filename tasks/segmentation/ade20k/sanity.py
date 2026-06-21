@@ -35,6 +35,7 @@ from datasets import load_dataset
 from torch.utils.data import DataLoader, IterableDataset
 
 from spixrwkv7.kernels.optimized_vision import create_optimized_vision_rwkv7 as _create_model
+from spixrwkv7.models.vq_rwkv7 import create_vq_rwkv7
 from spixrwkv7.data.transforms import prepare_balanced_superpixel_features
 
 # ---------------------------------------------------------------------------
@@ -232,22 +233,38 @@ class SegHead(nn.Module):
 class ADE20KSegModel(nn.Module):
     """SpixRWKV-7 backbone + 1x1 conv segmentation head."""
 
-    def __init__(self, config: dict, num_classes: int):
+    def __init__(self, config: dict, num_classes: int, model_type: str = "spix"):
         super().__init__()
-        self.backbone = _create_model(
-            img_size=config["img_size"],
-            embed_dims=config["embed_dims"],
-            num_heads=config["num_heads"],
-            depth=config["depth"],
-            num_superpixels=config["num_superpixels"],
-            drop_path_rate=config.get("drop_path_rate", 0.0),
-            scatter_output=True,
-            diff_slic_iters=config.get("diff_slic_iters", 1),
-            compactness=config.get("compactness", 0.5),
-            init_values=1e-5,
-            norm_layer="rmsnorm",
-            act_layer="swiglu",
-        )
+        self.model_type = model_type
+        if model_type == "vq":
+            self.backbone = create_vq_rwkv7(
+                img_size=config["img_size"],
+                embed_dims=config["embed_dims"],
+                num_heads=config["num_heads"],
+                depth=config["depth"],
+                drop_path_rate=config.get("drop_path_rate", 0.0),
+                scatter_output=True,
+                init_values=1e-5,
+                norm_layer="rmsnorm",
+                act_layer="swiglu",
+                codebook_size=config.get("codebook_size", 1024),
+                downsample_factor=config.get("downsample_factor", 16),
+            )
+        else:
+            self.backbone = _create_model(
+                img_size=config["img_size"],
+                embed_dims=config["embed_dims"],
+                num_heads=config["num_heads"],
+                depth=config["depth"],
+                num_superpixels=config["num_superpixels"],
+                drop_path_rate=config.get("drop_path_rate", 0.0),
+                scatter_output=True,
+                diff_slic_iters=config.get("diff_slic_iters", 1),
+                compactness=config.get("compactness", 0.5),
+                init_values=1e-5,
+                norm_layer="rmsnorm",
+                act_layer="swiglu",
+            )
         self.seg_head = SegHead(config["embed_dims"], num_classes)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -311,6 +328,12 @@ def main() -> None:
     parser.add_argument("--shuffle-buffer", type=int, default=100)
     parser.add_argument("--target-accuracy", type=float, default=0.0,
                         help="Stop early when pixel accuracy >= this")
+    parser.add_argument("--model-type", choices=["spix", "vq"], default="spix",
+                        help="Backbone type (default: spix)")
+    parser.add_argument("--codebook-size", type=int, default=1024,
+                        help="VQ codebook size")
+    parser.add_argument("--downsample-factor", type=int, default=16,
+                        help="VQ downsample factor")
     args = parser.parse_args()
 
     torch.manual_seed(args.seed)
@@ -383,7 +406,7 @@ def main() -> None:
     )
 
     # --- Model ---
-    model = ADE20KSegModel(cfg, NUM_CLASSES).to(device)
+    model = ADE20KSegModel(cfg, NUM_CLASSES, model_type=args.model_type).to(device)
     total_params = sum(p.numel() for p in model.parameters())
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"  Model params: {total_params:,} (trainable: {trainable:,})")
@@ -412,6 +435,10 @@ def main() -> None:
             optimizer.zero_grad(set_to_none=True)
             logits = model(inputs)
             loss = criterion(logits, targets)
+            if args.model_type == "vq":
+                q_loss = getattr(model.backbone, "_last_q_loss", None)
+                if q_loss is not None:
+                    loss = loss + q_loss
 
             if torch.isnan(loss).item():
                 print(f"  E{epoch:02d} B{batch_idx+1:03d} loss=NaN -- skipping batch")

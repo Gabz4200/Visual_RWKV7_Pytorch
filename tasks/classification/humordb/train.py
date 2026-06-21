@@ -33,6 +33,7 @@ from datasets import load_dataset
 from torch.utils.data import DataLoader, Dataset
 
 from spixrwkv7.kernels.optimized_vision import create_optimized_vision_rwkv7 as _create_model
+from spixrwkv7.models.vq_rwkv7 import create_vq_rwkv7
 from spixrwkv7.data.transforms import prepare_balanced_superpixel_features
 
 # ---------------------------------------------------------------------------
@@ -356,6 +357,26 @@ def main() -> None:
         "--init-values", type=float, default=1e-5,
         help="Weight initialization scale for RWKV params"
     )
+    parser.add_argument(
+        "--model-type", choices=["spix", "vq"], default="spix",
+        help="Backbone type (default: spix)"
+    )
+    parser.add_argument(
+        "--codebook-size", type=int, default=1024,
+        help="VQ codebook size"
+    )
+    parser.add_argument(
+        "--downsample-factor", type=int, default=16,
+        help="VQ downsample factor"
+    )
+    parser.add_argument(
+        "--latent-dim", type=int, default=None,
+        help="VQ latent dimension (default: embed_dims)"
+    )
+    parser.add_argument(
+        "--num-res-blocks", type=int, default=2,
+        help="Number of VQ residual blocks"
+    )
     # Training hyper-parameters
     parser.add_argument(
         "--batch-size", type=int, default=8,
@@ -395,7 +416,21 @@ def main() -> None:
         "--rebuild-cache", action="store_true",
         help="Force rebuild of preprocessed cache (ignore existing .pt files)",
     )
+    parser.add_argument(
+        "--max-train-samples", type=int, default=None,
+        help="Max train samples to use (default: use all)"
+    )
+    parser.add_argument(
+        "--max-val-samples", type=int, default=None,
+        help="Max validation samples to use (default: use all)"
+    )
     args = parser.parse_args()
+
+    if args.max_train_samples is not None:
+        _DATASET_SIZES["train"] = args.max_train_samples
+    if args.max_val_samples is not None:
+        _DATASET_SIZES["validation"] = args.max_val_samples
+        _DATASET_SIZES["test"] = args.max_val_samples
 
     ckpt_dir = Path(args.checkpoint_dir)
     ckpt_dir.mkdir(parents=True, exist_ok=True)
@@ -412,26 +447,48 @@ def main() -> None:
     print("  SpixRWKV-7 — HumorDB Funniness Regression")
     print("=" * 72)
 
-    backbone = _create_model(
-        img_size=args.img_size,
-        embed_dims=args.embed_dims,
-        num_heads=args.num_heads,
-        depth=args.depth,
-        init_values=args.init_values,
-        final_norm=True,
-        out_indices=[args.depth - 1],
-        with_cls_token=False,
-        output_cls_token=False,
-        scatter_output=False,
-        num_superpixels=args.num_superpixels,
-        diff_slic_iters=args.diff_slic_iters,
-        compactness=args.compactness,
-        drop_path_rate=args.drop_path_rate,
-        norm_layer="rmsnorm",
-        act_layer="swiglu",
-    ).to(device)
+    if args.model_type == "vq":
+        backbone = create_vq_rwkv7(
+            img_size=args.img_size,
+            embed_dims=args.embed_dims,
+            num_heads=args.num_heads,
+            depth=args.depth,
+            init_values=args.init_values,
+            final_norm=True,
+            out_indices=[args.depth - 1],
+            with_cls_token=False,
+            output_cls_token=False,
+            scatter_output=False,
+            drop_path_rate=args.drop_path_rate,
+            codebook_size=args.codebook_size,
+            downsample_factor=args.downsample_factor,
+            latent_dim=args.latent_dim,
+            num_res_blocks=args.num_res_blocks,
+            norm_layer="rmsnorm",
+            act_layer="swiglu",
+        ).to(device)
+        backbone._init_weights()
+    else:
+        backbone = _create_model(
+            img_size=args.img_size,
+            embed_dims=args.embed_dims,
+            num_heads=args.num_heads,
+            depth=args.depth,
+            init_values=args.init_values,
+            final_norm=True,
+            out_indices=[args.depth - 1],
+            with_cls_token=False,
+            output_cls_token=False,
+            scatter_output=False,
+            num_superpixels=args.num_superpixels,
+            diff_slic_iters=args.diff_slic_iters,
+            compactness=args.compactness,
+            drop_path_rate=args.drop_path_rate,
+            norm_layer="rmsnorm",
+            act_layer="swiglu",
+        ).to(device)
 
-    backbone._init_weights()
+        backbone._init_weights()
 
     model = HumorRegressor(backbone, embed_dims=args.embed_dims).to(device)
 
@@ -512,6 +569,10 @@ def main() -> None:
             preds = model(images)  # (B,)
 
             loss = F.mse_loss(preds, targets)
+            if args.model_type == "vq":
+                q_loss = getattr(model.backbone, "_last_q_loss", None)
+                if q_loss is not None:
+                    loss = loss + q_loss
             loss.backward()
 
             gn = compute_grad_norm(model)

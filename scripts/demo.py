@@ -13,6 +13,7 @@ sys.path.insert(0, str(_ROOT))
 import numpy as np
 import torch
 from spixrwkv7.kernels.optimized_vision import create_optimized_vision_rwkv7 as _create_model
+from spixrwkv7.models.vq_rwkv7 import create_vq_rwkv7
 from spixrwkv7.data.transforms import preprocess_image_for_rwkv7
 
 # Inspired by: https://arxiv.org/abs/2109.08203
@@ -34,6 +35,16 @@ def main():
     parser.add_argument("--act-layer", type=str, default="swiglu")
     parser.add_argument("--spixel-backend", type=str, default="diff_slic", choices=["diff_slic", "grid", "slic", "slico", "lnsnet"])
     parser.add_argument("--use-attnres", action="store_true", help="Enable Attention Residuals")
+    parser.add_argument("--model-type", choices=["spix", "vq"], default="spix",
+                        help="Backbone type (default: spix)")
+    parser.add_argument("--codebook-size", type=int, default=1024,
+                        help="VQ codebook size")
+    parser.add_argument("--downsample-factor", type=int, default=16,
+                        help="VQ downsample factor")
+    parser.add_argument("--latent-dim", type=int, default=None,
+                        help="VQ latent dimension (default: embed_dims)")
+    parser.add_argument("--num-res-blocks", type=int, default=2,
+                        help="Number of VQ residual blocks")
     parser.add_argument("--output", type=str, default="results/demo.txt")
     args = parser.parse_args()
 
@@ -43,23 +54,42 @@ def main():
         os.makedirs(out_dir, exist_ok=True)
 
     with redirect_stdout_tee(args.output):
-        # Initialize the new Vision-RWKV-7 with Superpixel Tokenization (diffSLIC)
-        model = _create_model(
-            img_size=args.img_size,
-            embed_dims=args.embed_dims,
-            num_heads=args.num_heads,
-            depth=args.depth,
-            init_values=1e-5,
-            final_norm=True,
-            out_indices=[args.depth - 1],
-            num_superpixels=args.num_superpixels,
-            scatter_output=True,
-            diff_slic_iters=args.diff_slic_iters,
-            norm_layer=args.norm_layer,
-            act_layer=args.act_layer,
-            spixel_backend=args.spixel_backend,
-            use_attnres=args.use_attnres,
-        )
+        # Initialize the model (Superpixel or VQ)
+        if args.model_type == "vq":
+            model = create_vq_rwkv7(
+                img_size=args.img_size,
+                embed_dims=args.embed_dims,
+                num_heads=args.num_heads,
+                depth=args.depth,
+                init_values=1e-5,
+                final_norm=True,
+                out_indices=[args.depth - 1],
+                scatter_output=True,
+                codebook_size=args.codebook_size,
+                downsample_factor=args.downsample_factor,
+                latent_dim=args.latent_dim,
+                num_res_blocks=args.num_res_blocks,
+                norm_layer=args.norm_layer,
+                act_layer=args.act_layer,
+                use_attnres=args.use_attnres,
+            )
+        else:
+            model = _create_model(
+                img_size=args.img_size,
+                embed_dims=args.embed_dims,
+                num_heads=args.num_heads,
+                depth=args.depth,
+                init_values=1e-5,
+                final_norm=True,
+                out_indices=[args.depth - 1],
+                num_superpixels=args.num_superpixels,
+                scatter_output=True,
+                diff_slic_iters=args.diff_slic_iters,
+                norm_layer=args.norm_layer,
+                act_layer=args.act_layer,
+                spixel_backend=args.spixel_backend,
+                use_attnres=args.use_attnres,
+            )
 
         # Model created on CPU, then moved to device (standard PyTorch pattern)
         callable_model = model.eval().to(TORCH_DEVICE)

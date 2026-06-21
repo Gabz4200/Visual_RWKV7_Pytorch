@@ -116,6 +116,7 @@ Visual_RWKV7_Pytorch/
                             SpatialMixer, RecurrentScan, ChannelMix,
                             ClassificationHead, _DynamicOffset, _TimeMixParams,
                             create_vision_rwkv7
+      vq_rwkv7.py      -- VQ-RWKV-7 model alternative (VQ-VAE tokenization ablation)
     data/
       colors.py        -- OkLAB/sRGB conversion utilities
       gamut.py         -- OkLAB gamut clipping methods
@@ -175,10 +176,11 @@ Visual_RWKV7_Pytorch/
 Key files:
 
 - **`spixrwkv7/models/spixrwkv7.py`** — The primary architecture file. Contains all core modules organized in a clear reading order: utility classes → `RecurrentScan` → `SpatialMixer` → `ChannelMix` → `Vision_RWKV7_Block` → `SuperpixelEmbedding` → `SuperpixelTokenizer` → `Vision_RWKV7` → `ClassificationHead` → builder.
+- **`spixrwkv7/models/vq_rwkv7.py`** — The VQ-RWKV-7 model file. Implements VQTokenizer, VectorQuantizer, ConvolutionalVQVAE, VQ_RWKV7, and create_vq_rwkv7.
 - **`spixrwkv7/data/diff_slic.py`** — Handles the irregular tokenization logic.
 - **`spixrwkv7/layers/graph.py`** — KNN graph construction and Graph Q-Shift.
 - **`tasks/`** — Training convergence tests and task-specific training scripts. `tasks/classification/humordb/train.py`/`infer.py` demonstrate the full pipeline: HuggingFace dataset loading, disk caching of preprocessed 6-channel tensors, regression head, checkpointing, and metrics. Not part of the core inference package.
-- **`tests/`** — Granular tests for each subsystem (96 tests total).
+- **`tests/`** — Granular tests for each subsystem (126 tests total).
 - **`scripts/demo.py`** — Standalone demo showing model instantiation, forward pass, parameter count, and determinism verification.
 
 ## Opening Issues
@@ -214,7 +216,7 @@ Key files:
 Tests are located in the `tests/` directory and use `pytest`.
 
 ```bash
-# Run the full test suite (103 tests)
+# Run the full test suite (126 tests)
 uv run pytest
 
 # Run a specific test file
@@ -226,7 +228,7 @@ uv run pytest -v -W all
 
 The test suite covers:
 
-- **Model Architecture** (test_model.py) — forward pass finiteness, determinism, multi-scale output, CLS token, gradient flow, superpixel embedding modes, graph Q-shift logic, non-square inputs, dynamic resolution via `spixel_size`, alternative superpixel backends ("grid", "slic", "slico", "lnsnet"), Attention Residuals (AttnRes) modes and gates.
+- **Model Architecture** (test_model.py) — forward pass finiteness, determinism, multi-scale output, CLS token, gradient flow, superpixel embedding modes, graph Q-shift logic, non-square inputs, dynamic resolution via `spixel_size`, alternative superpixel backends ("grid", "slic", "slico", "lnsnet"), Attention Residuals (AttnRes) modes and gates, and Convolutional VQ-VAE model and VQTokenizer variants.
 - **RWKV-7-specific features** — decoupled keys (`.r_k`, `.k_k`), vector-valued decay (`.w0`) and ICLR (`.a0`), state update formula, v_first propagation, input-dependent mixing.
 - **Color Space Correctness** (test_colors.py) — OkLAB/sRGB conversions, gamut clipping stability, finite gradients.
 - **diffSLIC Stability** (test_diff_slic.py) — no NaNs on black/uniform images, gradient flow, soft/hard modes.
@@ -246,6 +248,12 @@ uv run python tasks/diagnostics/fast_test_training.py --use-attnres
 ```
 # Step 2: Systematic diagnostics
 uv run python tasks/diagnostics/diagnose_training.py --all
+```
+
+To run diagnostic training with VQ-VAE model:
+```bash
+uv run python tasks/diagnostics/fast_test_training.py --model-type vq --img-size 64
+uv run python tasks/diagnostics/diagnose_training.py --model-type vq
 ```
 
 These are NOT part of the pytest suite (they require a training setup), but should be run before merging architectural changes to verify the model still converges.
@@ -319,7 +327,7 @@ Before closing a PR or marking a change as complete:
 - [ ] All modified files are free of debug prints, TODO comments, and commented-out code.
 - [ ] If the PR touches `spixrwkv7/models/spixrwkv7.py`, verify `spixrwkv7/kernels/optimized_block.py` and `spixrwkv7/kernels/optimized_vision.py` are updated to maintain dual-implementation sync.
 - [ ] If C++ kernel changes were made, rebuild and verify `uv run python scripts/demo.py` still produces finite outputs with `--use-cpp` flag (or verify fallback works).
-- [ ] The test suite passes cleanly (103 tests).
+- [ ] The test suite passes cleanly (126 tests).
 - [ ] Any new parameters or public APIs are reflected in the relevant docstrings.
 - [ ] No stale branches, merge artifacts, or temporary files remain.
 - [ ] If the change affects inference behavior, update `scripts/demo.py` or add a new demo path.

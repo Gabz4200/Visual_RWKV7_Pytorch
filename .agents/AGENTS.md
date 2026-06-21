@@ -49,6 +49,7 @@ The optimized versions inherit from or compose the PyTorch implementations and d
     - `_DynamicOffset`, `_TimeMixParams`: Internal helpers for time-mixing.
     - `create_vision_rwkv7`: Builder function enforcing 6-channel input (Lab + alpha + xy).
 - **Other core files**:
+    - `spixrwkv7/models/vq_rwkv7.py`: VQ-RWKV-7 model alternative (VQ-VAE tokenization ablation). Contains VectorQuantizer, ConvolutionalVQVAE, VQTokenizer, VQ_RWKV7, and create_vq_rwkv7.
     - `spixrwkv7/data/diff_slic.py`: Differentiable superpixel tokenization.
     - `spixrwkv7/data/colors.py`: OkLAB/sRGB conversion utilities.
     - `spixrwkv7/data/gamut.py`: OkLAB gamut clipping methods.
@@ -58,7 +59,7 @@ The optimized versions inherit from or compose the PyTorch implementations and d
     - `spixrwkv7/kernels/optimized_block.py`: `OptimizedRecurrentScan`, `OptimizedSpatialMixer`, `OptimizedVision_RWKV7_Block`.
     - `spixrwkv7/kernels/optimized_vision.py`: `OptimizedVision_RWKV7`, `create_optimized_vision_rwkv7`.
 - **No training code in core package**: The `spixrwkv7/` package is inference-only. Training scripts live in `tasks/`.
-- **Public symbols** (exported from `spixrwkv7`): `Vision_RWKV7`, `Vision_RWKV7_Block`, `SuperpixelEmbedding`, `ClassificationHead`, `create_vision_rwkv7`, `build_knn_graph`, `q_shift_graph_multihead`, `HEAD_SIZE`, `drop_path`, `DropPath`, `DiffSLIC`, `spixel_upsampling`, `spixel_downsampling`. Do not rename or change their signatures without updating all callers.
+- **Public symbols** (exported from `spixrwkv7`): `Vision_RWKV7`, `Vision_RWKV7_Block`, `SuperpixelEmbedding`, `ClassificationHead`, `create_vision_rwkv7`, `build_knn_graph`, `q_shift_graph_multihead`, `HEAD_SIZE`, `drop_path`, `DropPath`, `DiffSLIC`, `spixel_upsampling`, `spixel_downsampling`, `VQ_RWKV7`, `create_vq_rwkv7`. Do not rename or change their signatures without updating all callers.
 - **Architectural enhancements**: `norm_layer` (`layernorm`/`rmsnorm`) and `act_layer` (`relu2`/`gelu`/`silu`/`swiglu`) are configurable across backbone, blocks, and head.
 - **Registers**: DINOv2-style register tokens accessible via `register_tokens` parameter (prepended to sequence before blocks).
 - **Dynamic img_size**: `img_size` in transforms (default `-1` = original resolution, positive = proportional scale to target height).
@@ -117,7 +118,7 @@ The optimized versions inherit from or compose the PyTorch implementations and d
 
 ## Mandatory Checks Before PR
 
-- [ ] `uv run pytest` passes all 103 tests.
+- [ ] `uv run pytest` passes all 126 tests.
 - [ ] If the PR touches `spixrwkv7/models/spixrwkv7.py`, verify `spixrwkv7/kernels/optimized_block.py` and `spixrwkv7/kernels/optimized_vision.py` are updated to maintain dual-implementation sync.
 - [ ] If C++ kernel changes were made, rebuild and verify `uv run python scripts/demo.py` still produces finite outputs with `--use-cpp` flag (or verify fallback works).
 - [ ] `uv run python scripts/demo.py` runs without errors and prints `All outputs finite: True`.

@@ -28,6 +28,7 @@ if __name__ == "__main__":
 
 from spixrwkv7 import ClassificationHead
 from spixrwkv7.kernels.optimized_vision import create_optimized_vision_rwkv7 as _create_model
+from spixrwkv7.models.vq_rwkv7 import create_vq_rwkv7
 
 # ---------------------------------------------------------------------------
 # Default hyper-parameters (tuned for single-batch overfit)
@@ -94,6 +95,16 @@ def main() -> None:
     )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--use-attnres", action="store_true", help="Enable Attention Residuals")
+    parser.add_argument("--model-type", choices=["spix", "vq"], default="spix",
+                        help="Backbone type (default: spix)")
+    parser.add_argument("--codebook-size", type=int, default=1024,
+                        help="VQ codebook size")
+    parser.add_argument("--downsample-factor", type=int, default=16,
+                        help="VQ downsample factor")
+    parser.add_argument("--latent-dim", type=int, default=None,
+                        help="VQ latent dimension (default: embed_dims)")
+    parser.add_argument("--num-res-blocks", type=int, default=2,
+                        help="Number of VQ residual blocks")
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -108,28 +119,51 @@ def main() -> None:
     # ------------------------------------------------------------------
     # Model
     # ------------------------------------------------------------------
-    backbone = _create_model(
-        img_size=args.img_size,
-        embed_dims=args.embed_dims,
-        num_heads=args.num_heads,
-        depth=args.depth,
-        init_values=_INIT_VALUES,
-        final_norm=True,
-        out_indices=[args.depth - 1],  # only last layer
-        with_cls_token=False,
-        output_cls_token=False,
-        scatter_output=False,
-        num_superpixels=args.num_superpixels,
-        diff_slic_iters=1,  # single iter — fast enough to check convergence
-        compactness=0.5,
-        drop_path_rate=_DROP_PATH,
-        norm_layer="rmsnorm",
-        act_layer="swiglu",
-        use_attnres=args.use_attnres,
-    ).to(device)
+    if args.model_type == "vq":
+        backbone = create_vq_rwkv7(
+            img_size=args.img_size,
+            embed_dims=args.embed_dims,
+            num_heads=args.num_heads,
+            depth=args.depth,
+            init_values=_INIT_VALUES,
+            final_norm=True,
+            out_indices=[args.depth - 1],
+            with_cls_token=False,
+            output_cls_token=False,
+            scatter_output=False,
+            drop_path_rate=_DROP_PATH,
+            codebook_size=args.codebook_size,
+            downsample_factor=args.downsample_factor,
+            latent_dim=args.latent_dim,
+            num_res_blocks=args.num_res_blocks,
+            norm_layer="rmsnorm",
+            act_layer="swiglu",
+            use_attnres=args.use_attnres,
+        ).to(device)
+        backbone._init_weights()
+    else:
+        backbone = _create_model(
+            img_size=args.img_size,
+            embed_dims=args.embed_dims,
+            num_heads=args.num_heads,
+            depth=args.depth,
+            init_values=_INIT_VALUES,
+            final_norm=True,
+            out_indices=[args.depth - 1],  # only last layer
+            with_cls_token=False,
+            output_cls_token=False,
+            scatter_output=False,
+            num_superpixels=args.num_superpixels,
+            diff_slic_iters=1,  # single iter — fast enough to check convergence
+            compactness=0.5,
+            drop_path_rate=_DROP_PATH,
+            norm_layer="rmsnorm",
+            act_layer="swiglu",
+            use_attnres=args.use_attnres,
+        ).to(device)
 
-    # Re-init weights for reproducibility
-    backbone._init_weights()
+        # Re-init weights for reproducibility
+        backbone._init_weights()
 
     head = ClassificationHead(
         embed_dims=args.embed_dims, num_classes=args.num_classes
@@ -209,6 +243,10 @@ def main() -> None:
         else:
             logits = head(feat)         # (B, num_classes)
         loss = F.cross_entropy(logits, y)
+        if args.model_type == "vq":
+            q_loss = getattr(backbone, "_last_q_loss", None)
+            if q_loss is not None:
+                loss = loss + q_loss
 
         # Backward
         loss.backward()

@@ -21,6 +21,7 @@ import yaml
 from pathlib import Path
 
 from spixrwkv7.kernels.optimized_vision import create_optimized_vision_rwkv7 as _create_model
+from spixrwkv7.models.vq_rwkv7 import create_vq_rwkv7
 
 
 def load_config(config_path: str) -> Dict[str, Any]:
@@ -198,16 +199,20 @@ def benchmark_rwkv_components(
             if device == "cuda":
                 torch.cuda.synchronize()
 
-    # Time tokenizer (diffSLIC) separately
+    # Time tokenizer separately
     tokenizer_times = []
-    with torch.no_grad():
-        for _ in range(timed_runs):
-            start = time.perf_counter()
-            _ = model.tokenizer(input_tensor)
-            if device == "cuda":
-                torch.cuda.synchronize()
-            end = time.perf_counter()
-            tokenizer_times.append((end - start) * 1000)
+    tokenizer = getattr(model, "tokenizer", None)
+    if tokenizer is not None:
+        with torch.no_grad():
+            for _ in range(timed_runs):
+                start = time.perf_counter()
+                _ = tokenizer(input_tensor)
+                if device == "cuda":
+                    torch.cuda.synchronize()
+                end = time.perf_counter()
+                tokenizer_times.append((end - start) * 1000)
+    else:
+        tokenizer_times = [0.0] * timed_runs
 
     # Time full forward pass
     full_times = []
@@ -245,6 +250,7 @@ def run_size_comparison(
     batch_size: int,
     use_parallel: bool = False,
     hard_mode: bool = False,
+    model_type: str = "spix",
 ) -> List[Dict[str, Any]]:
     """Run comparison across model sizes at their configured image resolutions."""
     results = []
@@ -267,7 +273,24 @@ def run_size_comparison(
         print(f"  num_superpixels: {num_superpixels}")
 
         # Create Vision RWKV-7 model (optimized if available) with RMSNorm + SwiGLU
-        rwkv_model = _create_model(
+        if model_type == "vq":
+            rwkv_model = create_vq_rwkv7(
+                img_size=img_size,
+                embed_dims=embed_dims,
+                num_heads=num_heads,
+                depth=depth,
+                init_values=config.get("init_values", 1e-5),
+                final_norm=config.get("final_norm", True),
+                out_indices=config.get("out_indices", [-1]),
+                scatter_output=config.get("scatter_output", True),
+                drop_path_rate=config.get("drop_path_rate", 0.0),
+                codebook_size=config.get("codebook_size", 1024),
+                downsample_factor=config.get("downsample_factor", 16),
+                norm_layer=config.get("norm_layer", "layernorm"),
+                act_layer=config.get("act_layer", "relu2"),
+            )
+        else:
+            rwkv_model = _create_model(
             img_size=img_size,
             embed_dims=embed_dims,
             num_heads=num_heads,
@@ -284,12 +307,15 @@ def run_size_comparison(
             use_parallel=use_parallel,
         )
         # Enable hard mode for diffSLIC tokenizer (seeds-revised style)
-        if hard_mode:
-            # Set mode="hard" at tokenizer level for seeds-revised behavior
-            rwkv_model.tokenizer.mode = "hard"
-            rwkv_model.tokenizer.diff_slic.hard_mode = True
-            print(f"  Using hard diffSLIC mode (seeds-revised)")
-        if use_parallel:
+        if hard_mode and model_type != "vq":
+            tokenizer = getattr(rwkv_model, "tokenizer", None)
+            if tokenizer is not None:
+                setattr(tokenizer, "mode", "hard")
+                diff_slic = getattr(tokenizer, "diff_slic", None)
+                if diff_slic is not None:
+                    setattr(diff_slic, "hard_mode", True)
+            print("  Using hard diffSLIC mode (seeds-revised)")
+        if use_parallel and model_type != "vq":
             print(f"  Using parallel RWKV-7 scan")
 
         rwkv_params = count_parameters(rwkv_model)
@@ -363,6 +389,7 @@ def run_resolution_sweep(
     batch_size: int,
     use_parallel: bool = False,
     hard_mode: bool = False,
+    model_type: str = "spix",
 ):
     """Run comparison for a single model size across increasing image resolutions."""
     print(f"\n{'=' * 70}")
@@ -386,26 +413,47 @@ def run_resolution_sweep(
         print(f"\n  --- Image size: {img_size}x{img_size} ---")
 
         # Create Vision RWKV-7 model (optimized if available)
-        rwkv_model = _create_model(
-            img_size=img_size,
-            embed_dims=embed_dims,
-            num_heads=num_heads,
-            depth=depth,
-            init_values=config.get("init_values", 1e-5),
-            final_norm=config.get("final_norm", True),
-            out_indices=config.get("out_indices", [-1]),
-            num_superpixels=num_superpixels,
-            scatter_output=config.get("scatter_output", True),
-            diff_slic_iters=config.get("diff_slic_iters", 5),
-            compactness=config.get("compactness", 0.5),
-            norm_layer=config.get("norm_layer", "layernorm"),
-            act_layer=config.get("act_layer", "relu2"),
-            use_parallel=use_parallel,
-        )
-        if hard_mode:
-            rwkv_model.tokenizer.mode = "hard"
-            rwkv_model.tokenizer.diff_slic.hard_mode = True
-        if use_parallel:
+        if model_type == "vq":
+            rwkv_model = create_vq_rwkv7(
+                img_size=img_size,
+                embed_dims=embed_dims,
+                num_heads=num_heads,
+                depth=depth,
+                init_values=config.get("init_values", 1e-5),
+                final_norm=config.get("final_norm", True),
+                out_indices=config.get("out_indices", [-1]),
+                scatter_output=config.get("scatter_output", True),
+                drop_path_rate=config.get("drop_path_rate", 0.0),
+                codebook_size=config.get("codebook_size", 1024),
+                downsample_factor=config.get("downsample_factor", 16),
+                norm_layer=config.get("norm_layer", "layernorm"),
+                act_layer=config.get("act_layer", "relu2"),
+            )
+        else:
+            rwkv_model = _create_model(
+                img_size=img_size,
+                embed_dims=embed_dims,
+                num_heads=num_heads,
+                depth=depth,
+                init_values=config.get("init_values", 1e-5),
+                final_norm=config.get("final_norm", True),
+                out_indices=config.get("out_indices", [-1]),
+                num_superpixels=num_superpixels,
+                scatter_output=config.get("scatter_output", True),
+                diff_slic_iters=config.get("diff_slic_iters", 5),
+                compactness=config.get("compactness", 0.5),
+                norm_layer=config.get("norm_layer", "layernorm"),
+                act_layer=config.get("act_layer", "relu2"),
+                use_parallel=use_parallel,
+            )
+        if hard_mode and model_type != "vq":
+            tokenizer = getattr(rwkv_model, "tokenizer", None)
+            if tokenizer is not None:
+                setattr(tokenizer, "mode", "hard")
+                diff_slic = getattr(tokenizer, "diff_slic", None)
+                if diff_slic is not None:
+                    setattr(diff_slic, "hard_mode", True)
+        if use_parallel and model_type != "vq":
             pass  # already passed to model
 
 
@@ -492,6 +540,10 @@ def main():
         "--skip-large", action="store_true", help="Skip large config (slow on CPU)"
     )
     parser.add_argument(
+        "--sizes", nargs="+", default=None,
+        help="List of model sizes to benchmark (default: tiny small medium large)",
+    )
+    parser.add_argument(
         "--resolution-sweep",
         nargs="+",
         type=int,
@@ -520,6 +572,12 @@ def main():
         default=True,
         help="Use optimized C++ kernel for RWKV-7 backbone (default: True)",
     )
+    parser.add_argument(
+        "--model-type",
+        choices=["spix", "vq"],
+        default="spix",
+        help="Backbone type (default: spix)",
+    )
     args = parser.parse_args()
 
     device = args.device
@@ -532,9 +590,12 @@ def main():
     print("=" * 70)
 
     config_dir = Path("configs/model")
-    sizes = ["tiny", "small", "medium", "large"]
-    if args.skip_large:
-        sizes = ["tiny", "small", "medium"]
+    if args.sizes is not None:
+        sizes = args.sizes
+    else:
+        sizes = ["tiny", "small", "medium", "large"]
+        if args.skip_large:
+            sizes = ["tiny", "small", "medium"]
 
     # Part 1: Model size comparison at configured resolutions
     print("\n" + "=" * 70)
@@ -544,6 +605,7 @@ def main():
         sizes, config_dir, device, args.warmup, args.runs, args.batch_size,
         use_parallel=args.use_parallel,
         hard_mode=args.hard_mode,
+        model_type=args.model_type,
     )
 
     # Part 2: Resolution sweep for selected model size
@@ -555,6 +617,7 @@ def main():
         args.warmup, args.runs, args.batch_size,
         use_parallel=args.use_parallel,
         hard_mode=args.hard_mode,
+        model_type=args.model_type,
     )
 
     # Final summary

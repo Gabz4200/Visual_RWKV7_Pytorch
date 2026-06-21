@@ -20,6 +20,10 @@ from spixrwkv7.models.spixrwkv7 import (
     Vision_RWKV7_Block,
     create_vision_rwkv7,
 )
+from spixrwkv7.models.vq_rwkv7 import (
+    VQ_RWKV7,
+    create_vq_rwkv7,
+)
 
 __all__ = [
     "ChannelMix",
@@ -37,10 +41,12 @@ __all__ = [
     "Vision_RWKV7_Block",
     "build_knn_graph",
     "create_optimized_vision_rwkv7",
+    "create_vq_rwkv7",
     "create_vision_rwkv7",
     "drop_path",
     "q_shift_graph_multihead",
     "rwkv7_forward",
     "spixel_downsampling",
     "spixel_upsampling",
+    "VQ_RWKV7",
 ]

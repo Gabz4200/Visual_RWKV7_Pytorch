@@ -7,6 +7,12 @@ from spixrwkv7.models.spixrwkv7 import (
     Vision_RWKV7_Block,
     create_vision_rwkv7,
 )
+from spixrwkv7.models.vq_rwkv7 import (
+    VectorQuantizer,
+    ConvolutionalVQVAE,
+    VQ_RWKV7,
+    create_vq_rwkv7,
+)
 
 
 # =====================================================================
@@ -30,6 +36,26 @@ class ModelConfig(TypedDict):
     with_cls_token: NotRequired[bool]
     output_cls_token: NotRequired[bool]
 
+
+class VQModelConfig(TypedDict):
+    img_size: int
+    embed_dims: int
+    depth: int
+    codebook_size: int
+    downsample_factor: int
+    latent_dim: int
+    in_chans: int
+
+
+_TINY_VQ_CONFIG: VQModelConfig = {
+    "img_size": 32,
+    "embed_dims": 64,
+    "depth": 2,
+    "codebook_size": 64,
+    "downsample_factor": 8,
+    "latent_dim": 32,
+    "in_chans": 6,
+}
 
 def get_dummy_neighbors(B, N, K=4):
     """Helper to create dummy valid neighbors for testing blocks."""
@@ -860,4 +886,371 @@ def test_attention_residuals():
             assert torch.isfinite(opt_logits).all()
 
 
+# =====================================================================
+# VectorQuantizer Tests
+# =====================================================================
 
+
+def test_vector_quantizer_nearest_neighbor():
+    """Verify that VectorQuantizer maps each input to the nearest codebook entry."""
+    vq = VectorQuantizer(n_e=4, e_dim=2, beta=0.25)
+    # Set fixed codebook: rows = [0,0], [1,0], [0,1], [1,1]
+    with torch.no_grad():
+        vq.embedding.copy_(
+            torch.tensor([[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0]])
+        )
+    # Input (B=1, C=2, H=2, W=2) — each spatial position closest to a diff entry
+    z = torch.tensor([[[[0.9, 0.0], [0.0, 0.9]], [[0.0, 0.0], [0.9, 0.9]]]])
+    # Expected nearest per position:
+    #   (0.9, 0.0) → entry 1  |  (0.0, 0.0) → entry 0
+    #   (0.0, 0.9) → entry 2  |  (0.9, 0.9) → entry 3
+    z_q, indices, q_loss = vq(z)
+    expected = torch.tensor([[[1, 0], [2, 3]]])
+    assert (indices == expected).all(), f"Expected {expected}, got {indices}"
+    assert z_q.shape == z.shape
+    assert torch.isfinite(z_q).all()
+    assert q_loss.ndim == 0  # scalar
+    assert q_loss > 0.0
+
+
+def test_vector_quantizer_straight_through():
+    """Verify straight-through gradient: grad flows to z, not just z_q."""
+    vq = VectorQuantizer(n_e=8, e_dim=4, beta=0.25)
+    z = torch.randn(2, 4, 6, 6, requires_grad=True)
+    z_q, _, q_loss = vq(z)
+    loss = z_q.sum() + q_loss
+    loss.backward()
+    assert z.grad is not None, "Straight-through failed: no grad on z"
+    assert torch.isfinite(z.grad).all()
+    # grad magnitude should match the chain through the straight-through copy
+    assert z.grad.abs().sum() > 0.0
+
+
+def test_vector_quantizer_codebook_loss():
+    """Verify codebook + commitment loss composition with beta scaling."""
+    beta = 0.5
+    vq = VectorQuantizer(n_e=16, e_dim=8, beta=beta)
+    z = torch.randn(1, 8, 4, 4)
+    z_q, _, q_loss = vq(z)
+    # The internal loss = codebook_loss + beta * commitment_loss
+    #   codebook_loss = F.mse_loss(z_q, z.detach())
+    #   commitment_loss = F.mse_loss(z_q.detach(), z)
+    expected_cl = F.mse_loss(z_q, z.detach())
+    expected_comm = F.mse_loss(z_q.detach(), z)
+    expected_loss = expected_cl + beta * expected_comm
+    assert torch.allclose(q_loss, expected_loss, atol=1e-6), (
+        f"q_loss {q_loss.item()} != expected {expected_loss.item()}"
+    )
+
+
+def test_vector_quantizer_ema_mode():
+    """Verify EMA mode updates cluster statistics and has different loss behavior."""
+    vq = VectorQuantizer(n_e=8, e_dim=4, use_ema=True, decay=0.9)
+    z = torch.randn(2, 4, 5, 5)
+    z_q, indices, q_loss = vq(z)
+    assert z_q.shape == z.shape
+    assert torch.isfinite(z_q).all()
+    # EMA buffers should be updated
+    assert vq.ema_cluster_size.sum() > 0.0
+    assert torch.isfinite(vq.ema_w).all()
+    # Loss in EMA mode: F.mse_loss(z_q.detach(), z) (no codebook loss term)
+    expected_loss = F.mse_loss(z_q.detach(), z)
+    assert torch.allclose(q_loss, expected_loss, atol=1e-6), (
+        f"EMA q_loss {q_loss.item()} != expected {expected_loss.item()}"
+    )
+
+
+def test_vector_quantizer_output_shapes():
+    """Verify VectorQuantizer output shapes for various input sizes."""
+    vq = VectorQuantizer(n_e=128, e_dim=16)
+    z = torch.randn(3, 16, 8, 7)
+    z_q, indices, q_loss = vq(z)
+    assert z_q.shape == (3, 16, 8, 7), f"z_q shape {z_q.shape}"
+    assert indices.shape == (3, 8, 7), f"indices shape {indices.shape}"
+    assert q_loss.ndim == 0
+    assert 0 <= indices.min() < 128
+    assert indices.max() < 128
+
+
+def test_vector_quantizer_codebook_usage():
+    """Verify different inputs map to different codebook entries."""
+    vq = VectorQuantizer(n_e=32, e_dim=8)
+    # Two very different inputs
+    z1 = torch.zeros(1, 8, 1, 1)
+    z2 = torch.ones(1, 8, 1, 1) * 10.0
+    _, idx1, _ = vq(z1)
+    _, idx2, _ = vq(z2)
+    assert idx1.item() != idx2.item(), (
+        f"Distinct inputs should map to different codes: {idx1.item()} vs {idx2.item()}"
+    )
+
+
+# =====================================================================
+# ConvolutionalVQVAE Tests
+# =====================================================================
+
+
+def test_conv_vqvae_forward_shapes():
+    """Verify ConvolutionalVQVAE forward pass output shapes."""
+    vqvae = ConvolutionalVQVAE(
+        in_chans=3, latent_dim=32, codebook_size=64,
+        downsample_factor=8, num_res_blocks=1,
+    )
+    x = torch.randn(2, 3, 32, 32)
+    recon, indices, q_loss = vqvae(x)
+    assert recon.shape == x.shape, f"recon shape {recon.shape} != {x.shape}"
+    assert indices.shape == (2, 4, 4), f"indices shape {indices.shape}"
+    assert q_loss.ndim == 0
+    assert torch.isfinite(recon).all()
+    assert torch.isfinite(q_loss)
+
+
+def test_conv_vqvae_encode_decode():
+    """Verify encode + decode round-trip matches forward."""
+    vqvae = ConvolutionalVQVAE(
+        in_chans=3, latent_dim=16, codebook_size=32,
+        downsample_factor=8, num_res_blocks=1,
+    )
+    x = torch.randn(1, 3, 32, 32)
+    # Encode
+    z_q, indices, enc_loss = vqvae.encode(x)
+    assert z_q.shape == (1, 16, 4, 4)
+    assert indices.shape == (1, 4, 4)
+    assert torch.isfinite(z_q).all()
+    # Decode
+    recon = vqvae.decode(z_q)
+    assert recon.shape == x.shape
+    # Forward should match encode + decode
+    fwd_recon, fwd_idx, fwd_loss = vqvae(x)
+    assert torch.allclose(recon, fwd_recon, atol=1e-6)
+    assert (indices == fwd_idx).all()
+    assert torch.allclose(enc_loss, fwd_loss, atol=1e-6)
+
+
+def test_conv_vqvae_downsample_factor():
+    """Verify latent spatial dims are reduced by downsample_factor."""
+    for factor in [4, 8]:
+        vqvae = ConvolutionalVQVAE(
+            in_chans=3, latent_dim=32, codebook_size=64,
+            downsample_factor=factor, num_res_blocks=1,
+        )
+        x = torch.randn(1, 3, 64, 64)
+        z_q, indices, _ = vqvae.encode(x)
+        h_expected, w_expected = 64 // factor, 64 // factor
+        assert z_q.shape == (1, 32, h_expected, w_expected), (
+            f"factor={factor}: z_q shape {z_q.shape}"
+        )
+        assert indices.shape == (1, h_expected, w_expected)
+        recon, _, _ = vqvae(x)
+        assert recon.shape == x.shape
+
+
+def test_conv_vqvae_gradient_flow():
+    """Verify gradients flow through the full VQ-VAE."""
+    vqvae = ConvolutionalVQVAE(
+        in_chans=3, latent_dim=16, codebook_size=32,
+        downsample_factor=8, num_res_blocks=1,
+    )
+    x = torch.randn(1, 3, 32, 32, requires_grad=True)
+    recon, _, q_loss = vqvae(x)
+    loss = F.mse_loss(recon, x) + q_loss
+    loss.backward()
+    assert x.grad is not None
+    assert torch.isfinite(x.grad).all()
+    assert x.grad.abs().sum() > 0.0
+    # Encoder/decoder params should have grads
+    enc_grad = vqvae.encoder[0].weight.grad
+    assert enc_grad is not None and torch.isfinite(enc_grad).all()
+    dec_grad = vqvae.decoder[-1].weight.grad
+    assert dec_grad is not None and torch.isfinite(dec_grad).all()
+
+
+def test_conv_vqvae_different_in_chans():
+    """Verify VQ-VAE handles different input channels."""
+    for in_chans in [1, 3, 6]:
+        vqvae = ConvolutionalVQVAE(
+            in_chans=in_chans, latent_dim=16, codebook_size=32,
+            downsample_factor=8, num_res_blocks=1,
+        )
+        x = torch.randn(1, in_chans, 32, 32)
+        recon, indices, q_loss = vqvae(x)
+        assert recon.shape == x.shape, f"{in_chans}ch: {recon.shape}"
+        assert torch.isfinite(recon).all()
+
+
+# =====================================================================
+# VQ_RWKV7 Backbone Tests
+# =====================================================================
+
+
+_VQ_TINY_CFG = dict(
+    img_size=32, embed_dims=64, depth=2, num_heads=1,
+    codebook_size=64, downsample_factor=8, latent_dim=32,
+    num_res_blocks=1, norm_layer="layernorm", act_layer="relu2",
+    drop_path_rate=0.0, final_norm=True, out_indices=(-1,),
+    with_cls_token=False, output_cls_token=False, scatter_output=False,
+    register_tokens=0, use_attnres=False,
+)
+
+
+def _make_vq_x() -> torch.Tensor:
+    return torch.randn(1, 6, 32, 32)
+
+
+def test_vq_rwkv7_forward_shapes():
+    """Verify VQ_RWKV7 forward pass produces correct output shape."""
+    model = VQ_RWKV7(**_VQ_TINY_CFG)
+    x = _make_vq_x()
+    outs = model(x)
+    assert len(outs) == 1, f"Expected 1 output, got {len(outs)}"
+    # Default: token grid 4x4 (32/8=4)
+    assert outs[0].shape == (1, 64, 4, 4), f"Shape {outs[0].shape}"
+    assert torch.isfinite(outs[0]).all()
+
+
+def test_vq_rwkv7_vq_loss():
+    """Verify _last_q_loss is populated after forward pass."""
+    model = VQ_RWKV7(**_VQ_TINY_CFG)
+    x = _make_vq_x()
+    _ = model(x)
+    assert hasattr(model, "_last_q_loss")
+    assert model._last_q_loss is not None
+    assert model._last_q_loss.ndim == 0  # scalar
+    assert model._last_q_loss > 0.0
+    assert torch.isfinite(model._last_q_loss)
+
+
+def test_vq_rwkv7_gradient_flow():
+    """Verify gradients flow through both RWKV-7 blocks and VQ-VAE components."""
+    model = VQ_RWKV7(**_VQ_TINY_CFG)
+    x = _make_vq_x().requires_grad_(True)
+    outs = model(x)
+    loss = outs[0].sum() + model._last_q_loss
+    loss.backward()
+    # Gradient flows to input (through VQ encoder)
+    assert x.grad is not None, "No gradient on input"
+    assert torch.isfinite(x.grad).all()
+    assert x.grad.abs().sum() > 0.0
+    # Gradient flows to VQ-VAE encoder weights
+    enc_conv = model.tokenizer.vqvae.encoder[0]
+    assert enc_conv.weight.grad is not None
+    assert torch.isfinite(enc_conv.weight.grad).all()
+    assert enc_conv.weight.grad.abs().sum() > 0.0
+    # Gradient flows to codebook
+    assert model.tokenizer.vqvae.quantizer.embedding.grad is not None
+    assert torch.isfinite(model.tokenizer.vqvae.quantizer.embedding.grad).all()
+    # Gradient flows to RWKV-7 block params
+    # Pick a parameter from the first block's spatial_mixer
+    block_params = list(model.blocks[0].spatial_mixer.parameters())
+    has_grad = any(p.grad is not None and p.grad.abs().sum() > 0.0 for p in block_params)
+    assert has_grad, "No block parameters received gradients"
+
+
+def test_vq_rwkv7_multi_scale_output():
+    """Verify multiple out_indices produce feature maps at different stages."""
+    cfg = dict(_VQ_TINY_CFG, out_indices=(0, 1))
+    model = VQ_RWKV7(**cfg)
+    x = _make_vq_x()
+    outs = model(x)
+    assert len(outs) == 2, f"Expected 2 outputs, got {len(outs)}"
+    # Both outputs should be 4x4 token grid (downsample_factor=8 for 32px)
+    for i, out in enumerate(outs):
+        assert out.shape == (1, 64, 4, 4), f"out[{i}] shape {out.shape}"
+        assert torch.isfinite(out).all()
+
+
+def test_vq_rwkv7_scatter_output():
+    """Verify scatter_output=True restores original input resolution."""
+    cfg = dict(_VQ_TINY_CFG, scatter_output=True)
+    model = VQ_RWKV7(**cfg)
+    x = _make_vq_x()
+    outs = model(x)
+    assert len(outs) == 1
+    assert outs[0].shape == (1, 64, 32, 32), f"Shape {outs[0].shape}"
+    assert torch.isfinite(outs[0]).all()
+
+
+def test_vq_rwkv7_cls_token():
+    """Verify CLS token handling in VQ_RWKV7."""
+    cfg = dict(_VQ_TINY_CFG, with_cls_token=True, output_cls_token=True)
+    model = VQ_RWKV7(**cfg)
+    x = _make_vq_x()
+    outs = model(x)
+    assert len(outs) == 1, f"Expected 1 output tuple, got {len(outs)}"
+    # When output_cls_token=True, each out is (feat, cls_token)
+    feat, cls_out = outs[0]
+    assert feat.shape == (1, 64, 4, 4), f"feat shape {feat.shape}"
+    assert cls_out.shape == (1, 64), f"cls shape {cls_out.shape}"
+    assert torch.isfinite(feat).all()
+    assert torch.isfinite(cls_out).all()
+
+
+
+
+
+def test_vq_rwkv7_deterministic():
+    """Verify same input produces same output across calls."""
+    model = VQ_RWKV7(**_VQ_TINY_CFG)
+    model.eval()
+    x = _make_vq_x()
+    with torch.no_grad():
+        out1 = model(x)[0]
+        out2 = model(x)[0]
+    assert torch.allclose(out1, out2, atol=1e-5)
+
+
+def test_vq_rwkv7_numerical_stability():
+    """Verify VQ_RWKV7 produces finite outputs with random input."""
+    model = VQ_RWKV7(**_VQ_TINY_CFG)
+    x = torch.randn(1, 6, 32, 32)
+    outs = model(x)
+    for out in outs:
+        assert torch.isfinite(out).all()
+
+
+def test_create_vq_rwkv7_enforces_in_chans_6():
+    """Verify create_vq_rwkv7 always creates model with in_chans=6."""
+    model = create_vq_rwkv7(
+        img_size=32, embed_dims=64, depth=2, num_heads=1,
+        codebook_size=64, downsample_factor=8, latent_dim=32,
+        num_res_blocks=1, drop_path_rate=0.0,
+    )
+    assert model.in_chans == 6, f"Expected in_chans=6, got {model.in_chans}"
+    # Forward with 6-channel input should work
+    x = torch.randn(1, 6, 32, 32)
+    outs = model(x)
+    assert len(outs) == 1
+    assert outs[0].shape == (1, 64, 4, 4)
+    assert torch.isfinite(outs[0]).all()
+
+
+def test_vq_rwkv7_non_square_input():
+    """Verify VQ_RWKV7 handles non-square inputs."""
+    cfg = dict(_VQ_TINY_CFG, img_size=64)  # Override img_size to 64
+    model = VQ_RWKV7(**cfg)
+    x = torch.randn(1, 6, 64, 48)
+    outs = model(x)
+    # downsample_factor=8 → 8x6 token grid
+    assert outs[0].shape == (1, 64, 8, 6), f"Shape {outs[0].shape}"
+    assert torch.isfinite(outs[0]).all()
+
+
+def test_vq_rwkv7_forward_finite_random():
+    """VQ_RWKV7 forward with random float input produces finite output."""
+    model = VQ_RWKV7(**_VQ_TINY_CFG)
+    x = torch.randn(2, 6, 32, 32)
+    outs = model(x)
+    assert len(outs) == 1
+    assert outs[0].shape == (2, 64, 4, 4)
+    assert torch.isfinite(outs[0]).all()
+
+
+def test_vq_rwkv7_attnres_mode():
+    """Verify VQ_RWKV7 with attention residuals enabled."""
+    cfg = dict(_VQ_TINY_CFG, use_attnres=True, attnres_mode="block")
+    model = VQ_RWKV7(**cfg)
+    x = _make_vq_x()
+    outs = model(x)
+    assert len(outs) == 1
+    assert outs[0].shape == (1, 64, 4, 4)
+    assert torch.isfinite(outs[0]).all()

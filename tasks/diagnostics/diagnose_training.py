@@ -22,6 +22,7 @@ sys.path.insert(0, str(_ROOT))
 
 from spixrwkv7 import ClassificationHead
 from spixrwkv7.kernels.optimized_vision import create_optimized_vision_rwkv7 as _create_model
+from spixrwkv7.models.vq_rwkv7 import create_vq_rwkv7
 
 
 def synth_batch(batch_size, num_classes, img_size, device):
@@ -30,26 +31,50 @@ def synth_batch(batch_size, num_classes, img_size, device):
     return x, y
 
 
-def build_model(depth, embed_dims, num_heads, num_superpixels, device):
-    backbone = _create_model(
-        img_size=512,
-        embed_dims=embed_dims,
-        num_heads=num_heads,
-        depth=depth,
-        init_values=1e-5,
-        final_norm=True,
-        out_indices=[depth - 1],
-        with_cls_token=False,
-        output_cls_token=False,
-        scatter_output=False,
-        num_superpixels=num_superpixels,
-        diff_slic_iters=1,
-        compactness=0.5,
-        drop_path_rate=0.0,
-        norm_layer="rmsnorm",
-        act_layer="swiglu",
-    ).to(device)
-    backbone._init_weights()
+def build_model(depth, embed_dims, num_heads, num_superpixels, device,
+                model_type="spix", codebook_size=1024, downsample_factor=16,
+                latent_dim=None, num_res_blocks=2):
+    if model_type == "vq":
+        backbone = create_vq_rwkv7(
+            img_size=512,
+            embed_dims=embed_dims,
+            num_heads=num_heads,
+            depth=depth,
+            init_values=1e-5,
+            final_norm=True,
+            out_indices=[depth - 1],
+            with_cls_token=False,
+            output_cls_token=False,
+            scatter_output=False,
+            drop_path_rate=0.0,
+            codebook_size=codebook_size,
+            downsample_factor=downsample_factor,
+            latent_dim=latent_dim,
+            num_res_blocks=num_res_blocks,
+            norm_layer="rmsnorm",
+            act_layer="swiglu",
+        ).to(device)
+        backbone._init_weights()
+    else:
+        backbone = _create_model(
+            img_size=512,
+            embed_dims=embed_dims,
+            num_heads=num_heads,
+            depth=depth,
+            init_values=1e-5,
+            final_norm=True,
+            out_indices=[depth - 1],
+            with_cls_token=False,
+            output_cls_token=False,
+            scatter_output=False,
+            num_superpixels=num_superpixels,
+            diff_slic_iters=1,
+            compactness=0.5,
+            drop_path_rate=0.0,
+            norm_layer="rmsnorm",
+            act_layer="swiglu",
+        ).to(device)
+        backbone._init_weights()
     head = ClassificationHead(embed_dims, 10).to(device)
     return backbone, head
 
@@ -67,6 +92,11 @@ def run(
     lr: float = 5e-4,
     max_steps: int = 2,
     seed: int = 42,
+    model_type: str = "spix",
+    codebook_size: int = 1024,
+    downsample_factor: int = 16,
+    latent_dim: int | None = None,
+    num_res_blocks: int = 2,
 ):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     torch.manual_seed(seed)
@@ -77,7 +107,12 @@ def run(
         f"embed_dims={embed_dims} lr={lr}")
 
     backbone, head = build_model(depth, embed_dims, num_heads,
-                                  num_superpixels, device)
+                                  num_superpixels, device,
+                                  model_type=model_type,
+                                  codebook_size=codebook_size,
+                                  downsample_factor=downsample_factor,
+                                  latent_dim=latent_dim,
+                                  num_res_blocks=num_res_blocks)
     total = sum(p.numel() for p in backbone.parameters())
     head_params = sum(p.numel() for p in head.parameters())
     log(f"PARAMS backbone={total} head={head_params}")
@@ -102,6 +137,9 @@ def run(
         outs = backbone(x)
         logits = head(outs[0])
         loss = F.cross_entropy(logits, y)
+        if getattr(backbone, "_last_q_loss", None) is not None:
+            q_loss = getattr(backbone, "_last_q_loss")
+            loss = loss + q_loss
         loss.backward()
 
         # --- Gradient diagnostics ---
@@ -207,7 +245,7 @@ def exp_gradient_deep():
     run(label="grad-diag-depth4", depth=4, max_steps=2)
     print()
 
-def exp_no_head():
+def exp_no_head(model_type="spix"):
     """Verify backbone features alone are finite and have nonzero variance."""
     log("=== NO-HEAD FEATURE SANITY ===")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -215,7 +253,7 @@ def exp_no_head():
     np.random.seed(42)
     random.seed(42)
     x, _ = synth_batch(4, 10, 512, device)
-    backbone, _ = build_model(2, 128, 2, 36, device)
+    backbone, _ = build_model(2, 128, 2, 36, device, model_type=model_type)
     with torch.no_grad():
         outs = backbone(x)
         feat = outs[0]
@@ -237,6 +275,16 @@ if __name__ == "__main__":
     parser.add_argument("--seeds", action="store_true")
     parser.add_argument("--grad-deep", action="store_true")
     parser.add_argument("--no-head", action="store_true")
+    parser.add_argument("--model-type", choices=["spix", "vq"], default="spix",
+                        help="Backbone type (default: spix)")
+    parser.add_argument("--codebook-size", type=int, default=1024,
+                        help="VQ codebook size")
+    parser.add_argument("--downsample-factor", type=int, default=16,
+                        help="VQ downsample factor")
+    parser.add_argument("--latent-dim", type=int, default=None,
+                        help="VQ latent dimension (default: embed_dims)")
+    parser.add_argument("--num-res-blocks", type=int, default=2,
+                        help="Number of VQ residual blocks")
     args = parser.parse_args()
 
     if not any(v for v in vars(args).values() if v is True):
@@ -254,5 +302,5 @@ if __name__ == "__main__":
         if args.all or args.grad_deep:
             exp_gradient_deep()
         if args.all or args.no_head:
-            exp_no_head()
+            exp_no_head(model_type=args.model_type)
     print('Results saved to results/diagnose_training.txt')
